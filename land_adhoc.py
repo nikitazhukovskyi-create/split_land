@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -116,6 +115,10 @@ def calculate_metrics(df):
     # ARPPU 0d ($): Revenue 0d / Payers 0d (Landing)
     arppu_0d_val = rev_0d_land / payers_0d_land_count if payers_0d_land_count > 0 else 0
 
+    # Landing -> Payer (24h): conversion from Landing to Payer within 24h of landing_at
+    # Uses Visitors as denominator (not Registered Users)
+    conv_land_payer_24h = (payers_0d_land_count / visitors * 100) if visitors > 0 else 0
+
     return {
         'Visitors': visitors,
         'Onboarding Users': onboarding,
@@ -149,6 +152,10 @@ def get_conversion_rates(metrics):
     # Denom: Total Registered Users
     conv_reg_payer_0d_land = (metrics['Payers 0d (Landing)'] / registered * 100) if registered > 0 else 0
     
+    # New: Landing -> Payer (24h)
+    # Denom: Total Visitors (Landing)
+    conv_land_payer_24h = (metrics['Payers 0d (Landing)'] / visitors * 100) if visitors > 0 else 0
+    
     return {
         'Landing -> Onboarding': conv_landing_onboarding,
         'Landing -> Registration': conv_landing_registration,
@@ -156,6 +163,7 @@ def get_conversion_rates(metrics):
         'Registration -> Payer': conv_registration_payer,
         'Registration -> Payer D0': conv_registration_payer_d0,
         'Reg -> Payer 0d': conv_reg_payer_0d_land,
+        'Landing -> Payer (24h)': conv_land_payer_24h,
     }
 
 # --- 3. Statistical Engines ---
@@ -293,6 +301,8 @@ def run_statistics(df, df_c, control_variant, variants, method='Bayesian'):
                 m_v['Payers'], n_reg_v, m_control['Payers'], n_reg_c)
             tests['Reg -> Payer 0d'] = run_frequentist_tests(
                 m_v['Payers 0d (Landing)'], n_reg_v, m_control['Payers 0d (Landing)'], n_reg_c)
+            tests['Landing -> Payer (24h)'] = run_frequentist_tests(
+                m_v['Payers 0d (Landing)'], n_vis_v, m_control['Payers 0d (Landing)'], n_vis_c)
                 
             tests['ARPU'] = run_frequentist_means(vec_arpu_c, vec_arpu_v)
             tests['ARPPU'] = run_frequentist_means(vec_arppu_c, vec_arppu_v)
@@ -308,6 +318,8 @@ def run_statistics(df, df_c, control_variant, variants, method='Bayesian'):
                 m_control['Payers'], n_reg_c, m_v['Payers'], n_reg_v)
             tests['Reg -> Payer 0d'] = run_bayesian_simulation_proportion(
                 m_control['Payers 0d (Landing)'], n_reg_c, m_v['Payers 0d (Landing)'], n_reg_v)
+            tests['Landing -> Payer (24h)'] = run_bayesian_simulation_proportion(
+                m_control['Payers 0d (Landing)'], n_vis_c, m_v['Payers 0d (Landing)'], n_vis_v)
                 
             tests['ARPU'] = run_bayesian_simulation_revenue(vec_arpu_c, vec_arpu_v)
             tests['ARPPU'] = run_bayesian_simulation_revenue(vec_arppu_c, vec_arppu_v)
@@ -330,7 +342,7 @@ def generate_comprehensive_summary(df, df_c, control_variant, variants, method, 
     # 1. Config & Dimensions
     metrics = [
         'Landing -> Onboarding', 'Landing -> Registration', 'Registration -> Payer',
-        'Reg -> Payer 0d', 'ARPU', 'ARPPU', 'ARPU 0d', 'ARPPU 0d'
+        'Reg -> Payer 0d', 'Landing -> Payer (24h)', 'ARPU', 'ARPPU', 'ARPU 0d', 'ARPPU 0d'
     ]
     
     # Use allowed dims if provided, else auto-detect (though logic is now in render_dashboard)
@@ -714,6 +726,7 @@ def render_dashboard():
         'Landing -> Registration', 
         'Registration -> Payer',
         'Reg -> Payer 0d',
+        'Landing -> Payer (24h)',
         'ARPU', 
         'ARPPU',
         'ARPU 0d',
@@ -754,6 +767,8 @@ def render_dashboard():
                     return int(m_dict['Payers']), int(m_dict['Registered Users'])
                 elif met_name == 'Reg -> Payer 0d':
                     return int(m_dict['Payers 0d (Landing)']), int(m_dict['Registered Users'])
+                elif met_name == 'Landing -> Payer (24h)':
+                    return int(m_dict['Payers 0d (Landing)']), int(m_dict['Visitors'])
                 elif met_name == 'ARPU':
                     return m_dict['Total Revenue'], int(m_dict['Visitors'])
                 elif met_name == 'ARPPU':
