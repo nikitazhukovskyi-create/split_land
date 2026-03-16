@@ -357,9 +357,52 @@ def generate_comprehensive_summary(df, df_c, control_variant, variants, method, 
     # Global Scan
     stats_global = run_statistics(df, df_c, control_variant, variants, method=method)
     
-    def parse_stats(res_stats, segment_name, counts):
+    def _get_metric_value(m_dict, c_dict, metric_name):
+        """Get absolute value string (num/den or $value) for a metric."""
+        is_mon = 'ARP' in metric_name
+        if metric_name == 'Landing -> Onboarding':
+            num, den = int(m_dict['Onboarding Users']), int(m_dict['Visitors'])
+            rate = c_dict.get(metric_name, 0)
+            return f"{rate:.2f}% ({num:,}/{den:,})"
+        elif metric_name == 'Landing -> Registration':
+            num, den = int(m_dict['Registered Users']), int(m_dict['Visitors'])
+            rate = c_dict.get(metric_name, 0)
+            return f"{rate:.2f}% ({num:,}/{den:,})"
+        elif metric_name == 'Registration -> Payer':
+            num, den = int(m_dict['Payers']), int(m_dict['Registered Users'])
+            rate = c_dict.get(metric_name, 0)
+            return f"{rate:.2f}% ({num:,}/{den:,})"
+        elif metric_name == 'Reg -> Payer 0d':
+            num, den = int(m_dict['Payers 0d (Landing)']), int(m_dict['Registered Users'])
+            rate = c_dict.get(metric_name, 0)
+            return f"{rate:.2f}% ({num:,}/{den:,})"
+        elif metric_name == 'Landing -> Payer (24h)':
+            num, den = int(m_dict['Payers 0d (Landing)']), int(m_dict['Visitors'])
+            rate = c_dict.get(metric_name, 0)
+            return f"{rate:.2f}% ({num:,}/{den:,})"
+        elif metric_name == 'ARPU':
+            return f"${m_dict['ARPU']:.2f} (${m_dict['Total Revenue']:,.0f}/{int(m_dict['Visitors']):,})"
+        elif metric_name == 'ARPPU':
+            return f"${m_dict['ARPPU']:.2f} (${m_dict['Total Revenue']:,.0f}/{int(m_dict['Payers']):,})"
+        elif metric_name == 'ARPU 0d':
+            return f"${m_dict['ARPU 0d']:.2f} (${m_dict['Revenue 0d (Landing)']:,.0f}/{int(m_dict['Registered Users']):,})"
+        elif metric_name == 'ARPPU 0d':
+            payers_0d = int(m_dict['Payers 0d (Landing)'])
+            return f"${m_dict['ARPPU 0d']:.2f} (${m_dict['Revenue 0d (Landing)']:,.0f}/{payers_0d:,})"
+        return "N/A"
+
+    def parse_stats(res_stats, segment_name, counts, seg_df, seg_df_c):
         for v in variants:
             res = res_stats.get(v, {})
+            
+            # Calculate metrics for control and variant in this segment
+            m_ctrl_seg = calculate_metrics(seg_df_c)
+            c_ctrl_seg = get_conversion_rates(m_ctrl_seg)
+            
+            df_v_seg = seg_df[seg_df['landingId'] == v]
+            m_var_seg = calculate_metrics(df_v_seg)
+            c_var_seg = get_conversion_rates(m_var_seg)
+            
             for m in metrics:
                 val, uplift = res.get(m, (0.5, 0.0) if method.startswith('Bayesian') else (1.0, 0.0))
                 
@@ -383,9 +426,12 @@ def generate_comprehensive_summary(df, df_c, control_variant, variants, method, 
                         res_type = 'winner' if uplift > 0 else 'loser'
                 
                 if is_sig:
-                    # Score for ranking: Abs(Uplift) * Confidence? 
-                    # Just Abs(Uplift) is fine for now, prioritizing winners.
                     score = abs(uplift)
+                    
+                    # Get absolute values for control and variant
+                    ctrl_val_str = _get_metric_value(m_ctrl_seg, c_ctrl_seg, m)
+                    var_val_str = _get_metric_value(m_var_seg, c_var_seg, m)
+                    
                     findings.append({
                         'metric': m,
                         'segment': segment_name,
@@ -394,7 +440,9 @@ def generate_comprehensive_summary(df, df_c, control_variant, variants, method, 
                         'uplift': uplift,
                         'confidence': confidence_str,
                         'score': score,
-                        'obs': counts.get(v, 0) # Store N obs
+                        'obs': counts.get(v, 0),
+                        'control_val': ctrl_val_str,
+                        'variant_val': var_val_str,
                     })
 
     # Run Global
@@ -402,7 +450,7 @@ def generate_comprehensive_summary(df, df_c, control_variant, variants, method, 
     def get_counts(dframe):
         return dframe['landingId'].value_counts().to_dict()
 
-    parse_stats(stats_global, "Global (All Traffic)", get_counts(df))
+    parse_stats(stats_global, "Global (All Traffic)", get_counts(df), df, df_c)
     
     # 2. 1-Level Breakdown
     # Loop each col, top 5 values
@@ -417,7 +465,7 @@ def generate_comprehensive_summary(df, df_c, control_variant, variants, method, 
             if not sub_df.empty and not sub_df_c.empty:
                 # Run Stats
                 s_res = run_statistics(sub_df, sub_df_c, control_variant, variants, method=method)
-                parse_stats(s_res, seg_name, get_counts(sub_df))
+                parse_stats(s_res, seg_name, get_counts(sub_df), sub_df, sub_df_c)
 
     # 3. 2-Level Breakdown (Top 2 dims only)
     priority_cols = ['country', 'platform_name', 'device_model', 'os','source']
@@ -441,7 +489,7 @@ def generate_comprehensive_summary(df, df_c, control_variant, variants, method, 
                 
                 if not sub_df.empty and not sub_df_c.empty:
                      s_res = run_statistics(sub_df, sub_df_c, control_variant, variants, method=method)
-                     parse_stats(s_res, seg_name, get_counts(sub_df))
+                     parse_stats(s_res, seg_name, get_counts(sub_df), sub_df, sub_df_c)
 
     # Sort and Format
     # Sort findings by Obs (Sample Size) desc as requested
@@ -491,17 +539,10 @@ def render_summary_widget(findings, control_var):
         data = []
         for f in f_list:
             # Lift formatting
-            lift_s = f"{f['uplift']:+.1f}%" if 'Conv' in f['metric'] or 'Reg' in f['metric'] else f"{f['uplift']:+.2f}"
+            lift_s = f"{f['uplift']:+.1f}%" if 'Conv' in f['metric'] or 'Reg' in f['metric'] or 'Landing' in f['metric'] else f"{f['uplift']:+.2f}"
             if 'Ar' in f['metric'] or 'Rev' in f['metric'] or 'AR' in f['metric']: # Financial
                  if '%' not in lift_s: lift_s = f"${f['uplift']:+.2f}"
             
-            # Format Obs in k
-            obs_s = f"{f['obs']/1000:.1f}k" if f['obs'] >= 1000 else str(f['obs'])
-            
-            # Format Obs in k (Just for tooltip/debug if we kept it, but user wants it gone from table)
-            # We keep it in the dict construction? No, user said "Code drops the 'Obs' column".
-            # Cleanest is to not append it to `data` list.
-
             # Append Comparison Context
             v_short = clean_name(f['variant'])
             c_short = clean_name(control_var)
@@ -510,9 +551,10 @@ def render_summary_widget(findings, control_var):
             data.append({
                 "Metric": f['metric'],
                 "Segment": seg_s,
+                "Control": f.get('control_val', 'N/A'),
+                "Variant": f.get('variant_val', 'N/A'),
                 "Lift": lift_s,
                 "Stat": f['confidence'],
-                # "Obs": obs_s # REMOVED per user request
             })
         return pd.DataFrame(data)
 
