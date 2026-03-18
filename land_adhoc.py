@@ -760,6 +760,44 @@ def render_dashboard():
     # Recalculate global stats for table view (cached anyway)
     stats_data = run_statistics(df_filtered, df_control_stats, control_variant, test_variants, method=stat_method)
 
+    # --- Total Metrics per Variant (no comparison, no segmentation) ---
+    st.subheader("Total Metrics per Variant")
+    
+    total_metrics_names = [
+        'Landing -> Registration',
+        'Landing -> Onboarding',
+        'Landing -> Payer (24h)',
+        'Reg -> Payer 0d',
+    ]
+    
+    total_rows = []
+    for v in selected_variants:
+        df_v = df_filtered[df_filtered['landingId'] == v]
+        m_v = calculate_metrics(df_v)
+        c_v = get_conversion_rates(m_v)
+        
+        row = {"Variant": v, "Visitors": f"{int(m_v['Visitors']):,}"}
+        
+        for met in total_metrics_names:
+            rate = c_v.get(met, 0)
+            if met == 'Landing -> Registration':
+                num, den = int(m_v['Registered Users']), int(m_v['Visitors'])
+            elif met == 'Landing -> Onboarding':
+                num, den = int(m_v['Onboarding Users']), int(m_v['Visitors'])
+            elif met == 'Landing -> Payer (24h)':
+                num, den = int(m_v['Payers 0d (Landing)']), int(m_v['Visitors'])
+            elif met == 'Reg -> Payer 0d':
+                num, den = int(m_v['Payers 0d (Landing)']), int(m_v['Registered Users'])
+            else:
+                num, den = 0, 0
+            
+            row[met] = f"{rate:.2f}% ({num:,}/{den:,})"
+        
+        total_rows.append(row)
+    
+    df_total = pd.DataFrame(total_rows)
+    st.dataframe(df_total, width="stretch", hide_index=True)
+
     # --- Metrics Table ---
     st.subheader("Detailed Performance")
     
