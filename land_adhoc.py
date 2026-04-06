@@ -95,13 +95,11 @@ def calculate_metrics(df):
     arppu = total_amount / payers if payers > 0 else 0
 
     # 3. New Day 0 Metrics (Based on landing_at)
-    # Reg -> Payer 0d (Landing): fo_at - landing_at <= 24h
     payers_0d_land_count = 0
     rev_0d_land = 0
     
     if 'fo_at' in df.columns and 'landing_at' in df.columns:
         df_pay_land = df.dropna(subset=['fo_at', 'landing_at'])
-        # Unique users who matched condition
         payers_0d_land_count = df_pay_land[(df_pay_land['fo_at'] - df_pay_land['landing_at']) <= pd.Timedelta(hours=24)]['user_id'].nunique()
         
     if 'amount' in df.columns and 'order_created_at' in df.columns and 'landing_at' in df.columns:
@@ -115,10 +113,6 @@ def calculate_metrics(df):
     # ARPPU 0d ($): Revenue 0d / Payers 0d (Landing)
     arppu_0d_val = rev_0d_land / payers_0d_land_count if payers_0d_land_count > 0 else 0
 
-    # Landing -> Payer (24h): conversion from Landing to Payer within 24h of landing_at
-    # Uses Visitors as denominator (not Registered Users)
-    conv_land_payer_24h = (payers_0d_land_count / visitors * 100) if visitors > 0 else 0
-
     return {
         'Visitors': visitors,
         'Onboarding Users': onboarding,
@@ -128,7 +122,6 @@ def calculate_metrics(df):
         'Total Revenue': total_amount,
         'ARPU': arpu,
         'ARPPU': arppu,
-        # New Metrics Handlers
         'Payers 0d (Landing)': payers_0d_land_count,
         'Revenue 0d (Landing)': rev_0d_land,
         'ARPU 0d': arpu_0d_val,
@@ -147,13 +140,7 @@ def get_conversion_rates(metrics):
     conv_onboarding_registration = (registered / onboarding * 100) if onboarding > 0 else 0
     conv_registration_payer = (payers / registered * 100) if registered > 0 else 0
     conv_registration_payer_d0 = (metrics['Payers (Day 0)'] / registered * 100) if registered > 0 else 0
-    
-    # New: Reg -> Payer 0d (Landing)
-    # Denom: Total Registered Users
     conv_reg_payer_0d_land = (metrics['Payers 0d (Landing)'] / registered * 100) if registered > 0 else 0
-    
-    # New: Landing -> Payer (24h)
-    # Denom: Total Visitors (Landing)
     conv_land_payer_24h = (metrics['Payers 0d (Landing)'] / visitors * 100) if visitors > 0 else 0
     
     return {
@@ -243,39 +230,22 @@ def run_statistics(df, df_c, control_variant, variants, method='Bayesian'):
         merged = pd.Series(reg, name='user_id').to_frame().merge(pay, on='user_id', how='left').fillna(0)
         return merged['amount'].values, dframe.dropna(subset=['fo_at'])['amount'].values
 
-    # New Vectors for 0d Revenue Stats? 
-    # For now, we apply stats to main metrics. 
-    # User didn't strictly ask for stats on 0d metrics, just to add them to table. 
-    # I will stick to main metrics for stats to avoid complexity explosion, or add if easy.
-    # New metrics are "Reg -> Payer 0d", "ARPU 0d", "ARPPU 0d".
-    # I will add Stats for them if possible.
-    
-    # Vectors for Control
-    vec_arpu_c, vec_arppu_c = get_rev_vec(df_c)
-    
-    # Vectors for ARPU 0d?
-    # ARPU 0d = Revenue 0d per Registered User.
-    # We need a vector of 0d revenue per registered user.
     def get_rev_0d_vec(dframe):
         if 'landing_at' not in dframe.columns or 'order_created_at' not in dframe.columns:
             return np.array([]), np.array([])
             
         reg_users = dframe[dframe['reg_at'].notnull()]['user_id'].unique()
         
-        # Filter orders in 0d
         df_ord = dframe.dropna(subset=['order_created_at', 'landing_at', 'amount'])
         df_ord_0d = df_ord[(df_ord['order_created_at'] - df_ord['landing_at']) <= pd.Timedelta(hours=24)]
         
         pay_0d = df_ord_0d.groupby('user_id')['amount'].sum().reset_index()
         
-        # ARPU 0d Vector: All reg users, 0 if no pay
         merged_arpu = pd.Series(reg_users, name='user_id').to_frame().merge(pay_0d, on='user_id', how='left').fillna(0)
         
-        # ARPPU 0d Vector: Only Payers 0d
-        # Payers 0d defined as those who paid within 24h of landing
-        # This is exactly pay_0d['amount']
         return merged_arpu['amount'].values, pay_0d['amount'].values
 
+    vec_arpu_c, vec_arppu_c = get_rev_vec(df_c)
     vec_arpu_0d_c, vec_arppu_0d_c = get_rev_0d_vec(df_c)
     
     n_vis_c = m_control['Visitors']
@@ -330,8 +300,6 @@ def run_statistics(df, df_c, control_variant, variants, method='Bayesian'):
         
     return results
 
-    return results
-
 def generate_comprehensive_summary(df, df_c, control_variant, variants, method, allowed_dims=None):
     """
     Scans dimensions (Global, 1-Level, 2-Level) for significant findings.
@@ -339,22 +307,17 @@ def generate_comprehensive_summary(df, df_c, control_variant, variants, method, 
     """
     findings = []
     
-    # 1. Config & Dimensions
     metrics = [
         'Landing -> Onboarding', 'Landing -> Registration', 'Registration -> Payer',
         'Reg -> Payer 0d', 'Landing -> Payer (24h)', 'ARPU', 'ARPPU', 'ARPU 0d', 'ARPPU 0d'
     ]
     
-    # Use allowed dims if provided, else auto-detect (though logic is now in render_dashboard)
     if allowed_dims is not None:
         cat_cols = allowed_dims
     else:
         exclude_cols = ['user_id', 'landingId', 'amount', 'id', 'product_cluster'] + DATE_COLS
         cat_cols = [c for c in df.columns if c not in exclude_cols and pd.api.types.is_string_dtype(df[c])]
-    # Prioritize Country/Platform/OS if present?
-    # HEURISTIC: Limit to top 5 values per dimension to prevent explosion
     
-    # Global Scan
     stats_global = run_statistics(df, df_c, control_variant, variants, method=method)
     
     def _get_metric_value(m_dict, c_dict, metric_name):
@@ -395,7 +358,6 @@ def generate_comprehensive_summary(df, df_c, control_variant, variants, method, 
         for v in variants:
             res = res_stats.get(v, {})
             
-            # Calculate metrics for control and variant in this segment
             m_ctrl_seg = calculate_metrics(seg_df_c)
             c_ctrl_seg = get_conversion_rates(m_ctrl_seg)
             
@@ -406,7 +368,6 @@ def generate_comprehensive_summary(df, df_c, control_variant, variants, method, 
             for m in metrics:
                 val, uplift = res.get(m, (0.5, 0.0) if method.startswith('Bayesian') else (1.0, 0.0))
                 
-                # Check Significance
                 is_sig = False
                 confidence_str = ""
                 
@@ -419,7 +380,7 @@ def generate_comprehensive_summary(df, df_c, control_variant, variants, method, 
                         is_sig = True
                         confidence_str = f"Prob {val:.1%}"
                         res_type = 'loser'
-                else: # Frequentist
+                else:
                     if val < 0.05:
                         is_sig = True
                         confidence_str = f"p={val:.4f}"
@@ -428,7 +389,6 @@ def generate_comprehensive_summary(df, df_c, control_variant, variants, method, 
                 if is_sig:
                     score = abs(uplift)
                     
-                    # Get absolute values for control and variant
                     ctrl_val_str = _get_metric_value(m_ctrl_seg, c_ctrl_seg, m)
                     var_val_str = _get_metric_value(m_var_seg, c_var_seg, m)
                     
@@ -445,32 +405,24 @@ def generate_comprehensive_summary(df, df_c, control_variant, variants, method, 
                         'variant_val': var_val_str,
                     })
 
-    # Run Global
-    # Helper to clean getting n_obs
     def get_counts(dframe):
         return dframe['landingId'].value_counts().to_dict()
 
     parse_stats(stats_global, "Global (All Traffic)", get_counts(df), df, df_c)
     
-    # 2. 1-Level Breakdown
-    # Loop each col, top 5 values
     for col in cat_cols:
         top_vals = df[col].value_counts().nlargest(5).index.tolist()
         for val in top_vals:
             seg_name = f"{col}={val}"
-            # Filter
             sub_df = df[df[col] == val]
             sub_df_c = df_c[df_c[col] == val]
             
             if not sub_df.empty and not sub_df_c.empty:
-                # Run Stats
                 s_res = run_statistics(sub_df, sub_df_c, control_variant, variants, method=method)
                 parse_stats(s_res, seg_name, get_counts(sub_df), sub_df, sub_df_c)
 
-    # 3. 2-Level Breakdown (Top 2 dims only)
     priority_cols = ['country', 'platform_name', 'device_model', 'os','source']
     selected_dims = [c for c in priority_cols if c in cat_cols]
-    # Fill with others if not enough
     for c in cat_cols:
         if c not in selected_dims: selected_dims.append(c)
     
@@ -478,7 +430,7 @@ def generate_comprehensive_summary(df, df_c, control_variant, variants, method, 
     
     if len(dims_2) == 2:
         c1, c2 = dims_2[0], dims_2[1]
-        top_vals_1 = df[c1].value_counts().nlargest(3).index.tolist() # Top 3 only
+        top_vals_1 = df[c1].value_counts().nlargest(3).index.tolist()
         top_vals_2 = df[c2].value_counts().nlargest(3).index.tolist()
         
         for v1 in top_vals_1:
@@ -491,8 +443,6 @@ def generate_comprehensive_summary(df, df_c, control_variant, variants, method, 
                      s_res = run_statistics(sub_df, sub_df_c, control_variant, variants, method=method)
                      parse_stats(s_res, seg_name, get_counts(sub_df), sub_df, sub_df_c)
 
-    # Sort and Format
-    # Sort findings by Obs (Sample Size) desc as requested
     findings.sort(key=lambda x: x['obs'], reverse=True)
     
     return findings
@@ -504,7 +454,6 @@ def render_summary_widget(findings, control_var):
         st.info("ℹ️ No statistically significant findings detected across major segments.")
         return
 
-    # A. Category Filter
     c_f_col, _ = st.columns([1, 2])
     cat_filter = c_f_col.radio("Metric Type", ['All', 'Monetary', 'Conversion'], horizontal=True)
 
@@ -519,31 +468,24 @@ def render_summary_widget(findings, control_var):
         st.info(f"No findings for category: {cat_filter}")
         return
 
-    # Split Wins and Losses
     wins = [f for f in filtered_findings if f['result'] == 'winner']
     losses = [f for f in filtered_findings if f['result'] == 'loser']
 
-    # Sort by Sample Size
     wins.sort(key=lambda x: x['obs'], reverse=True)
     losses.sort(key=lambda x: x['obs'], reverse=True)
-    
-    losses.sort(key=lambda x: x['obs'], reverse=True)
-    
-    # B. Short Name Helper
+
     def clean_name(s):
         if not isinstance(s, str): return str(s)
-        return s.split('-')[-1] # Take last part
+        return s.split('-')[-1]
 
     def format_df(f_list):
         if not f_list: return pd.DataFrame()
         data = []
         for f in f_list:
-            # Lift formatting
             lift_s = f"{f['uplift']:+.1f}%" if 'Conv' in f['metric'] or 'Reg' in f['metric'] or 'Landing' in f['metric'] else f"{f['uplift']:+.2f}"
-            if 'Ar' in f['metric'] or 'Rev' in f['metric'] or 'AR' in f['metric']: # Financial
+            if 'Ar' in f['metric'] or 'Rev' in f['metric'] or 'AR' in f['metric']:
                  if '%' not in lift_s: lift_s = f"${f['uplift']:+.2f}"
             
-            # Append Comparison Context
             v_short = clean_name(f['variant'])
             c_short = clean_name(control_var)
             seg_s = f"{f['segment']} ({v_short} vs {c_short})"
@@ -564,9 +506,6 @@ def render_summary_widget(findings, control_var):
         st.error("📉 Significant Losses (V < Control)")
         if losses:
             df_loss = format_df(losses)
-            # Display with color styling if possible, or just raw
-            # Using st.dataframe with Pandas Styler for red text in Lift
-            # Note: Streamlit dataframe styler support is good.
             st.dataframe(
                 df_loss.style.map(lambda x: 'color: red', subset=['Lift']),
                 width="stretch",
@@ -591,7 +530,6 @@ def render_summary_widget(findings, control_var):
 
 # --- Verdict Logic ---
 def get_stat_verdict(stat_val, uplift, method, n_c, n_v):
-    # n_c and n_v should be sample sizes (e.g. Visitors or Registered Users)
     if n_c < 100 or n_v < 100:
         return "⚠️ Insufficient Data"
     
@@ -602,13 +540,329 @@ def get_stat_verdict(stat_val, uplift, method, n_c, n_v):
         if stat_val < 0.05: return "📉 High Confidence Loser (<5%)"
         return "⚖️ Inconclusive"
     else:
-        # Frequentist
         if stat_val < 0.05:
             if uplift > 0: return "✅ Significant (Winner)"
             return "❌ Significant (Loser)"
         return "🤷 No Diff"
 
+
+# ============================================================
+# --- NEW: Date Breakdown Block ---
+# ============================================================
+
+def render_date_breakdown(df_filtered, selected_variants, control_variant):
+    """
+    Renders a date-based breakdown section below Total Metrics per Variant.
+    Allows user to:
+    - Choose granularity: Day / Week / Month
+    - Filter by specific date range
+    - Pick which metrics to display
+    - View table + time-series chart per metric
+    """
+
+    st.subheader("📅 Date Breakdown")
+
+    # --- Guard: requires landing_at ---
+    if 'landing_at' not in df_filtered.columns:
+        st.warning("Column `landing_at` not found. Date breakdown requires this column.")
+        return
+
+    df_dated = df_filtered.dropna(subset=['landing_at']).copy()
+    if df_dated.empty:
+        st.warning("No rows with valid `landing_at` values.")
+        return
+
+    # ── Controls row ──────────────────────────────────────────────────
+    col_gran, col_metric, col_dates = st.columns([1, 2, 2])
+
+    with col_gran:
+        granularity = st.selectbox(
+            "Granularity",
+            ['Day', 'Week', 'Month'],
+            index=0,
+            key='date_breakdown_gran'
+        )
+
+    with col_metric:
+        metric_options = [
+            'Visitors',
+            'Registered Users',
+            'Landing -> Registration',
+            'Landing -> Onboarding',
+            'Landing -> Payer (24h)',
+            'Reg -> Payer 0d',
+            'ARPU',
+            'ARPPU',
+            'ARPU 0d',
+            'ARPPU 0d',
+            'Total Revenue',
+        ]
+        selected_metrics = st.multiselect(
+            "Metrics to Show",
+            metric_options,
+            default=['Visitors', 'Landing -> Registration', 'Landing -> Payer (24h)', 'ARPU 0d'],
+            key='date_breakdown_metrics'
+        )
+
+    # Date range filter
+    min_date = df_dated['landing_at'].min().date()
+    max_date = df_dated['landing_at'].max().date()
+
+    with col_dates:
+        date_range = st.date_input(
+            "Date Range",
+            value=(min_date, max_date),
+            min_value=min_date,
+            max_value=max_date,
+            key='date_breakdown_range'
+        )
+
+    # Handle single-date selection (user clicked only start date)
+    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+        start_date, end_date = date_range
+    else:
+        start_date = end_date = date_range if not isinstance(date_range, (list, tuple)) else date_range[0]
+
+    # Apply date filter
+    df_dated = df_dated[
+        (df_dated['landing_at'].dt.date >= start_date) &
+        (df_dated['landing_at'].dt.date <= end_date)
+    ]
+
+    if df_dated.empty:
+        st.info("No data in selected date range.")
+        return
+
+    if not selected_metrics:
+        st.info("Select at least one metric to display.")
+        return
+
+    # ── Build period column ───────────────────────────────────────────
+    freq_map = {'Day': 'D', 'Week': 'W-MON', 'Month': 'MS'}
+    freq = freq_map[granularity]
+
+    if granularity == 'Day':
+        df_dated['_period'] = df_dated['landing_at'].dt.date
+    elif granularity == 'Week':
+        df_dated['_period'] = df_dated['landing_at'].dt.to_period('W').apply(lambda p: p.start_time.date())
+    else:  # Month
+        df_dated['_period'] = df_dated['landing_at'].dt.to_period('M').apply(lambda p: p.start_time.date())
+
+    # ── Aggregate per period × variant ───────────────────────────────
+    periods = sorted(df_dated['_period'].unique())
+    variants_to_show = selected_variants  # all selected variants
+
+    def _calc_row(sub_df, period, variant):
+        """Calculate all metrics for a given slice."""
+        m = calculate_metrics(sub_df)
+        c = get_conversion_rates(m)
+        return {
+            'Period': str(period),
+            'Variant': variant,
+            'Visitors': m['Visitors'],
+            'Registered Users': m['Registered Users'],
+            'Onboarding Users': m['Onboarding Users'],
+            'Payers': m['Payers'],
+            'Payers 0d (Landing)': m['Payers 0d (Landing)'],
+            'Total Revenue': m['Total Revenue'],
+            'ARPU': m['ARPU'],
+            'ARPPU': m['ARPPU'],
+            'ARPU 0d': m['ARPU 0d'],
+            'ARPPU 0d': m['ARPPU 0d'],
+            'Landing -> Registration': c['Landing -> Registration'],
+            'Landing -> Onboarding': c['Landing -> Onboarding'],
+            'Landing -> Payer (24h)': c['Landing -> Payer (24h)'],
+            'Reg -> Payer 0d': c['Reg -> Payer 0d'],
+            'Registration -> Payer': c['Registration -> Payer'],
+        }
+
+    rows = []
+    for period in periods:
+        df_p = df_dated[df_dated['_period'] == period]
+        for variant in variants_to_show:
+            df_pv = df_p[df_p['landingId'] == variant]
+            if df_pv.empty:
+                continue
+            rows.append(_calc_row(df_pv, period, variant))
+
+    if not rows:
+        st.warning("Not enough data to build date breakdown.")
+        return
+
+    df_breakdown = pd.DataFrame(rows)
+
+    # ── Display Mode Toggle ───────────────────────────────────────────
+    view_mode = st.radio(
+        "View as",
+        ['📊 Charts', '📋 Table', '📊 Charts + 📋 Table'],
+        horizontal=True,
+        key='date_breakdown_view'
+    )
+
+    show_charts = '📊' in view_mode
+    show_table = '📋' in view_mode
+
+    # ── CHARTS ────────────────────────────────────────────────────────
+    if show_charts:
+        is_rate = lambda m: m in [
+            'Landing -> Registration', 'Landing -> Onboarding',
+            'Landing -> Payer (24h)', 'Reg -> Payer 0d', 'Registration -> Payer'
+        ]
+        is_currency = lambda m: m in ['ARPU', 'ARPPU', 'ARPU 0d', 'ARPPU 0d', 'Total Revenue']
+
+        # Responsive columns: up to 2 charts per row
+        num_metrics = len(selected_metrics)
+        cols_per_row = 2 if num_metrics > 1 else 1
+        metric_chunks = [selected_metrics[i:i+cols_per_row] for i in range(0, num_metrics, cols_per_row)]
+
+        for chunk in metric_chunks:
+            chart_cols = st.columns(len(chunk))
+            for col_idx, metric_name in enumerate(chunk):
+                with chart_cols[col_idx]:
+                    fig = px.line(
+                        df_breakdown,
+                        x='Period',
+                        y=metric_name,
+                        color='Variant',
+                        markers=True,
+                        title=metric_name,
+                        labels={'Period': granularity, metric_name: metric_name}
+                    )
+
+                    # Format Y axis
+                    if is_rate(metric_name):
+                        fig.update_layout(yaxis_ticksuffix='%', yaxis_tickformat='.1f')
+                    elif is_currency(metric_name):
+                        fig.update_layout(yaxis_tickprefix='$', yaxis_tickformat=',.2f')
+
+                    fig.update_layout(
+                        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+                        margin=dict(t=50, b=30, l=10, r=10),
+                        hovermode='x unified'
+                    )
+                    fig.update_traces(
+                        hovertemplate='%{fullData.name}: %{y}<extra></extra>'
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+    # ── TABLE ─────────────────────────────────────────────────────────
+    if show_table:
+        display_cols = ['Period', 'Variant'] + selected_metrics
+
+        # Format for display
+        df_table = df_breakdown[display_cols].copy()
+
+        rate_cols = [m for m in selected_metrics if m in [
+            'Landing -> Registration', 'Landing -> Onboarding',
+            'Landing -> Payer (24h)', 'Reg -> Payer 0d', 'Registration -> Payer'
+        ]]
+        currency_cols = [m for m in selected_metrics if m in [
+            'ARPU', 'ARPPU', 'ARPU 0d', 'ARPPU 0d', 'Total Revenue'
+        ]]
+        int_cols = [m for m in selected_metrics if m in [
+            'Visitors', 'Registered Users', 'Onboarding Users',
+            'Payers', 'Payers 0d (Landing)'
+        ]]
+
+        format_dict = {}
+        for c in rate_cols:
+            format_dict[c] = '{:.2f}%'
+        for c in currency_cols:
+            format_dict[c] = '${:.2f}'
+        for c in int_cols:
+            format_dict[c] = '{:,.0f}'
+
+        # Pivot option: show variants side-by-side per period
+        pivot_view = st.checkbox("Pivot table (variants as columns)", value=True, key='date_breakdown_pivot')
+
+        if pivot_view and len(selected_metrics) == 1:
+            metric_name = selected_metrics[0]
+            df_pivot = df_table.pivot(index='Period', columns='Variant', values=metric_name)
+            df_pivot.columns.name = None
+            df_pivot = df_pivot.reset_index()
+
+            # Format numeric values
+            if metric_name in rate_cols:
+                fmt = lambda x: f"{x:.2f}%" if pd.notnull(x) else "—"
+            elif metric_name in currency_cols:
+                fmt = lambda x: f"${x:.2f}" if pd.notnull(x) else "—"
+            else:
+                fmt = lambda x: f"{int(x):,}" if pd.notnull(x) else "—"
+
+            for col in df_pivot.columns[1:]:
+                df_pivot[col] = df_pivot[col].apply(fmt)
+
+            st.dataframe(df_pivot, hide_index=True, use_container_width=True)
+
+        elif pivot_view and len(selected_metrics) > 1:
+            # Multi-metric pivot: Period | Metric | Variant_A | Variant_B ...
+            melted = df_table.melt(id_vars=['Period', 'Variant'], value_vars=selected_metrics, var_name='Metric')
+            pivoted = melted.pivot_table(index=['Period', 'Metric'], columns='Variant', values='value', aggfunc='first')
+            pivoted.columns.name = None
+            pivoted = pivoted.reset_index()
+
+            # Color-code: highlight control column differently
+            def style_pivot(row):
+                styles = [''] * len(row)
+                return styles
+
+            st.dataframe(pivoted, hide_index=True, use_container_width=True)
+
+        else:
+            # Flat table
+            styled = df_table.style
+            for col, fmt in format_dict.items():
+                styled = styled.format({col: fmt})
+            st.dataframe(styled, hide_index=True, use_container_width=True)
+
+    # ── Delta vs Control strip ────────────────────────────────────────
+    # Show period-level delta for non-control variants vs control
+    test_variants_for_delta = [v for v in variants_to_show if v != control_variant]
+
+    if test_variants_for_delta and len(selected_metrics) >= 1:
+        with st.expander("📐 Period-level Delta vs Control", expanded=False):
+            delta_metric = st.selectbox(
+                "Metric for delta view",
+                selected_metrics,
+                key='delta_metric_sel'
+            )
+
+            df_ctrl_ts = df_breakdown[df_breakdown['Variant'] == control_variant][['Period', delta_metric]].rename(
+                columns={delta_metric: '_ctrl'}
+            )
+
+            delta_rows = []
+            for tv in test_variants_for_delta:
+                df_tv = df_breakdown[df_breakdown['Variant'] == tv][['Period', delta_metric]].rename(
+                    columns={delta_metric: '_var'}
+                )
+                merged = pd.merge(df_ctrl_ts, df_tv, on='Period', how='inner')
+                merged['Delta'] = merged['_var'] - merged['_ctrl']
+                merged['Variant'] = tv
+                merged = merged.rename(columns={'_ctrl': f'{control_variant} (ctrl)', '_var': tv})
+                delta_rows.append(merged[['Period', 'Variant', f'{control_variant} (ctrl)', tv, 'Delta']])
+
+            if delta_rows:
+                df_delta = pd.concat(delta_rows, ignore_index=True)
+
+                fig_delta = px.bar(
+                    df_delta,
+                    x='Period',
+                    y='Delta',
+                    color='Variant',
+                    barmode='group',
+                    title=f"Period Delta: {delta_metric} (Variant - Control)",
+                )
+                fig_delta.add_hline(y=0, line_dash='dash', line_color='gray')
+                fig_delta.update_layout(hovermode='x unified')
+                st.plotly_chart(fig_delta, use_container_width=True)
+
+                st.dataframe(df_delta, hide_index=True, use_container_width=True)
+
+
+# ============================================================
 # --- 4. UI Layout ---
+# ============================================================
 
 def render_dashboard():
     # Instructions Expander
@@ -647,7 +901,6 @@ def render_dashboard():
         if data is not None:
              st.sidebar.success("✅ Custom file loaded")
     else:
-        # Fallback to default
         if DEFAULT_CSV_PATH:
              data = load_data(DEFAULT_CSV_PATH)
              if data is not None:
@@ -669,14 +922,12 @@ def render_dashboard():
         st.warning("Please select at least one variant.")
         return
 
-    # Filter by Variant Check
     df_main = data[data['landingId'].isin(selected_variants)]
 
     # --- Filters (Audience) ---
     with st.expander("🔍 Filter Audience", expanded=True):
         c1, c2 = st.columns(2)
         
-        # Country Filter
         sel_all_c = True
         if 'country' in df_main.columns:
             all_c = sorted(df_main['country'].dropna().unique())
@@ -690,7 +941,6 @@ def render_dashboard():
         else:
             countries = []
         
-        # Dynamic Platform Filter (if exists)
         platforms = []
         sel_all_p = True
         if 'platform_name' in df_main.columns:
@@ -702,7 +952,6 @@ def render_dashboard():
             else:
                 platforms = c2.multiselect("Platforms", all_p, default=all_p)
         
-        # Traffic Source Filter
         traffic_source = []
         sel_all_s = True
         if 'source' in df_main.columns:
@@ -714,7 +963,6 @@ def render_dashboard():
             else:
                 traffic_source = c2.multiselect("traffic source", all_s, default=all_s)
 
-        # Apply Filters Dynamically
         mask = pd.Series(True, index=df_main.index)
         
         if 'country' in df_main.columns and not sel_all_c:
@@ -735,32 +983,26 @@ def render_dashboard():
         return
 
     # Determine Control
-    # Default to first one or 'mm-nsp-v1' if present
     possible_controls = [v for v in selected_variants if 'v1' in v]
     control_variant = possible_controls[0] if possible_controls else selected_variants[0]
     
-    # Run Stats
-    # Separating Control Data for stats function
     df_control_stats = df_filtered[df_filtered['landingId'] == control_variant]
     test_variants = [v for v in selected_variants if v != control_variant]
     
     st.header("Executive Summary")
     
-    # Identify Dimensions for Scanning
     exclude_cols = ['user_id', 'landingId', 'amount', 'id', 'product_cluster'] + DATE_COLS
     all_cat_cols = [c for c in df_filtered.columns if c not in exclude_cols and pd.api.types.is_string_dtype(df_filtered[c])]
     
-    # Dimension Filter UI
     selected_dims = st.multiselect("Select Dimensions to Scan for Insights", all_cat_cols, default=all_cat_cols)
     
     with st.spinner("🤖 Scanning all data dimensions for insights..."):
         findings = generate_comprehensive_summary(df_filtered, df_control_stats, control_variant, test_variants, method=stat_method, allowed_dims=selected_dims)
         render_summary_widget(findings, control_variant)
         
-    # Recalculate global stats for table view (cached anyway)
     stats_data = run_statistics(df_filtered, df_control_stats, control_variant, test_variants, method=stat_method)
 
-    # --- Total Metrics per Variant (no comparison, no segmentation) ---
+    # --- Total Metrics per Variant ---
     st.subheader("Total Metrics per Variant")
     
     total_metrics_names = [
@@ -798,7 +1040,11 @@ def render_dashboard():
     df_total = pd.DataFrame(total_rows)
     st.dataframe(df_total, width="stretch", hide_index=True)
 
-    # --- Metrics Table ---
+    # ── NEW: Date Breakdown ─────────────────────────────────────────────
+    render_date_breakdown(df_filtered, selected_variants, control_variant)
+    # ───────────────────────────────────────────────────────────────────
+
+    # --- Detailed Performance ---
     st.subheader("Detailed Performance")
     
     metrics_list = [
@@ -815,15 +1061,7 @@ def render_dashboard():
     
     m_c = calculate_metrics(df_filtered[df_filtered['landingId'] == control_variant])
     c_c = get_conversion_rates(m_c)
-    # Map Financials to c_c for uniform access
     c_c.update({'ARPU': m_c['ARPU'], 'ARPPU': m_c['ARPPU'], 'ARPU 0d': m_c['ARPU 0d'], 'ARPPU 0d': m_c['ARPPU 0d']})
-    
-    # Store rows to create df later
-    # We display Control column + Variant columns
-    # Actually, the previous format was Metric | Control | Var 1 | Stat | Diff
-    # If multiple variants, we repeat rows? Or Pivot?
-    # Previous code: For v in variants: Print distinct table for V vs Control.
-    # We will stick to that as it's cleaner for stats.
     
     for v in test_variants:
         st.markdown(f"### {v} vs {control_variant} (Control)")
@@ -835,9 +1073,8 @@ def render_dashboard():
         rows = []
         for metric in metrics_list:
             val, uplift = res.get(metric, (0.5, 0.0) if stat_method.startswith('Bayesian') else (1.0, 0.0))
-            is_mon = 'ARP' in metric # ARPU, ARPPU, ARPU 0d, ARPPU 0d
-            
-            # Helper to get context counts
+            is_mon = 'ARP' in metric
+
             def get_ctx(m_dict, met_name):
                 if met_name == 'Landing -> Onboarding':
                     return int(m_dict['Onboarding Users']), int(m_dict['Visitors'])
@@ -859,14 +1096,12 @@ def render_dashboard():
                     return m_dict['Revenue 0d (Landing)'], int(m_dict['Payers 0d (Landing)'])
                 return 0, 0
 
-            # Control Context
             num_c, den_c = get_ctx(m_c, metric)
             if is_mon:
                 fmt_c = f"${c_c.get(metric,0):.2f} (${num_c:,.0f}/{den_c:,})"
             else:
                 fmt_c = f"{c_c.get(metric,0):.2f}% ({num_c:,}/{den_c:,})"
 
-            # Variant Context
             num_v, den_v = get_ctx(m_v, metric)
             if is_mon:
                 fmt_v = f"${c_v.get(metric,0):.2f} (${num_v:,.0f}/{den_v:,})"
@@ -875,15 +1110,13 @@ def render_dashboard():
             
             upl_d = f"${uplift:+.2f}" if is_mon else f"{uplift:+.2f}%"
             
-            # Context for verdict
             verdict = get_stat_verdict(val, uplift, stat_method, den_c, den_v)
             
             if stat_method.startswith('Bayesian'):
-                stat_s = f"{val:.1%}" # Clean text
+                stat_s = f"{val:.1%}"
             else:
-                stat_s = f"{val:.4f}" # Clean text
+                stat_s = f"{val:.4f}"
             
-            # Determine Sig for Coloring
             sig_type = "neutral"
             if "✅" in verdict or "🚀" in verdict: sig_type = "winner"
             elif "❌" in verdict or "📉" in verdict: sig_type = "loser"
@@ -893,19 +1126,18 @@ def render_dashboard():
                 "Control": fmt_c, 
                 "Variant": fmt_v, 
                 "Diff / Uplift": upl_d,
-                "Stat": stat_s, # Renamed col
+                "Stat": stat_s,
                 "_status": sig_type
             })
         
         df_display = pd.DataFrame(rows)
         
-        # Apply Styling
         def highlight_row(row):
             status = row['_status']
             if status == 'winner':
-                return ['background-color: #d1e7dd'] * len(row) # Light Green
+                return ['background-color: #d1e7dd'] * len(row)
             elif status == 'loser':
-                return ['background-color: #f8d7da'] * len(row) # Light Red
+                return ['background-color: #f8d7da'] * len(row)
             return [''] * len(row)
 
         st.dataframe(
@@ -920,12 +1152,9 @@ def render_dashboard():
     t1, t2, t3, t4 = st.tabs(["Funnel", "Revenue Dist", "Deep Dive: ARPPU Impact", "Audience Structure"])
 
     with t1:
-        # Funnel with Tooltips
         funnel_data = []
-        # Add 0d stats to funnel? "Payers 0d"
         funnel_metric_names = ['Visitors', 'Onboarding Users', 'Registered Users', 'Payers', 'Payers 0d (Landing)']
         
-        # We need all variants including control
         for v in [control_variant] + test_variants:
             m = calculate_metrics(df_filtered[df_filtered['landingId'] == v])
             for stage in funnel_metric_names:
@@ -933,7 +1162,6 @@ def render_dashboard():
         
         df_funnel = pd.DataFrame(funnel_data).drop_duplicates()
         if not df_funnel.empty:
-            # Sort Funnel Data Descending by Count
             df_funnel = df_funnel.sort_values(by='Count', ascending=False)
             
             fig_funnel = px.bar(df_funnel, x='Stage', y='Count', color='Variant', barmode='group')
@@ -944,13 +1172,11 @@ def render_dashboard():
          fig_box = px.box(df_filtered, x='landingId', y='amount', title="Revenue per User Distribution")
          st.plotly_chart(fig_box, use_container_width=True)
 
-    # --- Deep Dive: ARPPU Drivers ---
     with t3:
         st.markdown("##### ARPPU Drivers & Package Impact Analysis")
         
         c3, c4 = st.columns(2)
         comp_control = c3.selectbox("Control Group", selected_variants, index=0)
-        # Default test to second variant if exists
         def_test_idx = 1 if len(selected_variants) > 1 else 0
         comp_test = c4.selectbox("Test Group", selected_variants, index=def_test_idx)
         
@@ -958,19 +1184,12 @@ def render_dashboard():
         col_group = 'product_cluster' if pkg_view == 'Product Clusters' else 'id'
         
         if col_group in df_filtered.columns:
-            # Filter for just these two if needed? OR calculate for all but show impact for these two.
-            # We need contributions for both.
-            
-            # Contributors
             payers_per_variant = df_filtered[df_filtered['fo_at'].notnull()].groupby('landingId')['user_id'].nunique().to_dict()
             df_rev_pkg = df_filtered[df_filtered['fo_at'].notnull()].groupby(['landingId', col_group])['amount'].sum().reset_index()
             
             df_rev_pkg['total_payers'] = df_rev_pkg['landingId'].map(payers_per_variant)
             df_rev_pkg['contribution'] = df_rev_pkg['amount'] / df_rev_pkg['total_payers']
             
-            # Viz 1: Stacked Bar (All Selected Variants)
-            # Filter df_rev_pkg for selected variants only? No, Keep all for context is nice, or strict?
-            # User said "Show ALL selected variants" in Summary, here let's show all selected in stacked bar.
             fig_stack = px.bar(df_rev_pkg, x='landingId', y='contribution', color=col_group,
                                title=f"ARPPU Composition by {pkg_view} ($)", 
                                labels={'contribution': 'Contribution to ARPPU ($)', col_group: pkg_view})
@@ -978,7 +1197,6 @@ def render_dashboard():
             fig_stack.update_traces(hovertemplate='<b>%{data.name}</b><br>Contrib: $%{y:.2f}<extra></extra>')
             st.plotly_chart(fig_stack, use_container_width=True)
             
-            # Viz 2: Impact Analysis (Custom Comparison)
             df_pivot = df_rev_pkg.pivot(index=col_group, columns='landingId', values='contribution').fillna(0)
             
             if comp_control in df_pivot.columns and comp_test in df_pivot.columns:
@@ -995,7 +1213,6 @@ def render_dashboard():
                 fig_imp.update_traces(hovertemplate='<b>%{y}</b><br>Impact: $%{x:.2f}<extra></extra>')
                 st.plotly_chart(fig_imp, use_container_width=True)
                 
-                # Insight
                 best_pkg = df_impact.iloc[-1]
                 worst_pkg = df_impact.iloc[0]
                 insight_text = []
@@ -1009,16 +1226,10 @@ def render_dashboard():
         else:
             st.warning(f"Column '{col_group}' unavailable.")
 
-    # --- Audience Structure (Dynamic) ---
     with t4:
-        # Detect Categorical Columns
-        # Exclude known non-dims
         exclude_cols = ['user_id', 'landingId', 'amount', 'id', 'product_cluster'] + DATE_COLS
-        # Also exclude numeric types if not desired, but "concept" might be numeric-ish.
-        # Select object types + maybe 'concept'?
         cat_cols = [c for c in df_filtered.columns if c not in exclude_cols and pd.api.types.is_string_dtype(df_filtered[c])]
         
-        # Add special knowns if checks fail
         if 'country' in df_filtered.columns and 'country' not in cat_cols: cat_cols.append('country')
         if 'platform_name' in df_filtered.columns and 'platform_name' not in cat_cols: cat_cols.append('platform_name')
         if 'platform_model' in df_filtered.columns and 'platform_model' not in cat_cols: cat_cols.append('platform_model')
@@ -1028,8 +1239,6 @@ def render_dashboard():
         if cat_cols:
             dim_sel = st.selectbox("Choose Breakdown Dimension", cat_cols, index=0 if 'country' not in cat_cols else cat_cols.index('country'))
             
-            # Generic Chart Logic
-            # Top 15 values to avoid clutter
             top_vals = df_filtered[dim_sel].value_counts().nlargest(15).index
             df_sub = df_filtered[df_filtered[dim_sel].isin(top_vals)]
             
