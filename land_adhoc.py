@@ -550,19 +550,24 @@ def get_stat_verdict(stat_val, uplift, method, n_c, n_v):
 # --- NEW: Date Breakdown Block ---
 # ============================================================
 
+# Maps each rate metric → (numerator_col, denominator_col) from _calc_row
+RATE_COUNTS_MAP = {
+    'Landing -> Registration':  ('Registered Users',       'Visitors'),
+    'Landing -> Onboarding':    ('Onboarding Users',        'Visitors'),
+    'Landing -> Payer (24h)':   ('Payers 0d (Landing)',     'Visitors'),
+    'Reg -> Payer 0d':          ('Payers 0d (Landing)',     'Registered Users'),
+    'Registration -> Payer':    ('Payers',                  'Registered Users'),
+}
+
 def render_date_breakdown(df_filtered, selected_variants, control_variant):
     """
     Renders a date-based breakdown section below Total Metrics per Variant.
-    Allows user to:
-    - Choose granularity: Day / Week / Month
-    - Filter by specific date range
-    - Pick which metrics to display
-    - View table + time-series chart per metric
+    Charts: % labels on every data point.
+    Table: rate + raw counts (num/den) in each cell.
     """
 
     st.subheader("📅 Date Breakdown")
 
-    # --- Guard: requires landing_at ---
     if 'landing_at' not in df_filtered.columns:
         st.warning("Column `landing_at` not found. Date breakdown requires this column.")
         return
@@ -604,7 +609,6 @@ def render_date_breakdown(df_filtered, selected_variants, control_variant):
             key='date_breakdown_metrics'
         )
 
-    # Date range filter
     min_date = df_dated['landing_at'].min().date()
     max_date = df_dated['landing_at'].max().date()
 
@@ -617,13 +621,11 @@ def render_date_breakdown(df_filtered, selected_variants, control_variant):
             key='date_breakdown_range'
         )
 
-    # Handle single-date selection (user clicked only start date)
     if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
         start_date, end_date = date_range
     else:
         start_date = end_date = date_range if not isinstance(date_range, (list, tuple)) else date_range[0]
 
-    # Apply date filter
     df_dated = df_dated[
         (df_dated['landing_at'].dt.date >= start_date) &
         (df_dated['landing_at'].dt.date <= end_date)
@@ -638,42 +640,42 @@ def render_date_breakdown(df_filtered, selected_variants, control_variant):
         return
 
     # ── Build period column ───────────────────────────────────────────
-    freq_map = {'Day': 'D', 'Week': 'W-MON', 'Month': 'MS'}
-    freq = freq_map[granularity]
-
     if granularity == 'Day':
         df_dated['_period'] = df_dated['landing_at'].dt.date
     elif granularity == 'Week':
         df_dated['_period'] = df_dated['landing_at'].dt.to_period('W').apply(lambda p: p.start_time.date())
-    else:  # Month
+    else:
         df_dated['_period'] = df_dated['landing_at'].dt.to_period('M').apply(lambda p: p.start_time.date())
 
     # ── Aggregate per period × variant ───────────────────────────────
     periods = sorted(df_dated['_period'].unique())
-    variants_to_show = selected_variants  # all selected variants
+    variants_to_show = selected_variants
 
     def _calc_row(sub_df, period, variant):
-        """Calculate all metrics for a given slice."""
+        """Calculate all metrics + raw counts for a given slice."""
         m = calculate_metrics(sub_df)
         c = get_conversion_rates(m)
         return {
             'Period': str(period),
             'Variant': variant,
-            'Visitors': m['Visitors'],
-            'Registered Users': m['Registered Users'],
-            'Onboarding Users': m['Onboarding Users'],
-            'Payers': m['Payers'],
-            'Payers 0d (Landing)': m['Payers 0d (Landing)'],
+            # ── raw counts (needed for table annotations) ──
+            'Visitors':             m['Visitors'],
+            'Registered Users':     m['Registered Users'],
+            'Onboarding Users':     m['Onboarding Users'],
+            'Payers':               m['Payers'],
+            'Payers 0d (Landing)':  m['Payers 0d (Landing)'],
+            # ── monetary ──
             'Total Revenue': m['Total Revenue'],
-            'ARPU': m['ARPU'],
-            'ARPPU': m['ARPPU'],
-            'ARPU 0d': m['ARPU 0d'],
-            'ARPPU 0d': m['ARPPU 0d'],
+            'ARPU':          m['ARPU'],
+            'ARPPU':         m['ARPPU'],
+            'ARPU 0d':       m['ARPU 0d'],
+            'ARPPU 0d':      m['ARPPU 0d'],
+            # ── rate metrics (%) ──
             'Landing -> Registration': c['Landing -> Registration'],
-            'Landing -> Onboarding': c['Landing -> Onboarding'],
-            'Landing -> Payer (24h)': c['Landing -> Payer (24h)'],
-            'Reg -> Payer 0d': c['Reg -> Payer 0d'],
-            'Registration -> Payer': c['Registration -> Payer'],
+            'Landing -> Onboarding':   c['Landing -> Onboarding'],
+            'Landing -> Payer (24h)':  c['Landing -> Payer (24h)'],
+            'Reg -> Payer 0d':         c['Reg -> Payer 0d'],
+            'Registration -> Payer':   c['Registration -> Payer'],
         }
 
     rows = []
@@ -691,6 +693,41 @@ def render_date_breakdown(df_filtered, selected_variants, control_variant):
 
     df_breakdown = pd.DataFrame(rows)
 
+    # ── Helpers ──────────────────────────────────────────────────────
+    is_rate     = lambda m: m in RATE_COUNTS_MAP
+    is_currency = lambda m: m in ['ARPU', 'ARPPU', 'ARPU 0d', 'ARPPU 0d', 'Total Revenue']
+    is_int      = lambda m: m in ['Visitors', 'Registered Users', 'Onboarding Users',
+                                   'Payers', 'Payers 0d (Landing)']
+
+    def fmt_label(val, metric_name):
+        """Short label for chart data points."""
+        if is_rate(metric_name):
+            return f"{val:.1f}%"
+        elif is_currency(metric_name):
+            return f"${val:.2f}"
+        else:
+            return f"{int(val):,}"
+
+    def fmt_cell(row, metric_name):
+        """
+        Rich cell for table:
+          - rate metric  → '12.34%  (123/1,000)'
+          - currency     → '$1.23'
+          - int metric   → '1,234'
+        """
+        val = row[metric_name]
+        if pd.isnull(val):
+            return "—"
+        if is_rate(metric_name):
+            num_col, den_col = RATE_COUNTS_MAP[metric_name]
+            num = row.get(num_col, 0)
+            den = row.get(den_col, 0)
+            return f"{val:.2f}%  ({int(num):,}/{int(den):,})"
+        elif is_currency(metric_name):
+            return f"${val:.2f}"
+        else:
+            return f"{int(val):,}"
+
     # ── Display Mode Toggle ───────────────────────────────────────────
     view_mode = st.radio(
         "View as",
@@ -700,18 +737,11 @@ def render_date_breakdown(df_filtered, selected_variants, control_variant):
     )
 
     show_charts = '📊' in view_mode
-    show_table = '📋' in view_mode
+    show_table  = '📋' in view_mode
 
     # ── CHARTS ────────────────────────────────────────────────────────
     if show_charts:
-        is_rate = lambda m: m in [
-            'Landing -> Registration', 'Landing -> Onboarding',
-            'Landing -> Payer (24h)', 'Reg -> Payer 0d', 'Registration -> Payer'
-        ]
-        is_currency = lambda m: m in ['ARPU', 'ARPPU', 'ARPU 0d', 'ARPPU 0d', 'Total Revenue']
-
-        # Responsive columns: up to 2 charts per row
-        num_metrics = len(selected_metrics)
+        num_metrics  = len(selected_metrics)
         cols_per_row = 2 if num_metrics > 1 else 1
         metric_chunks = [selected_metrics[i:i+cols_per_row] for i in range(0, num_metrics, cols_per_row)]
 
@@ -719,17 +749,32 @@ def render_date_breakdown(df_filtered, selected_variants, control_variant):
             chart_cols = st.columns(len(chunk))
             for col_idx, metric_name in enumerate(chunk):
                 with chart_cols[col_idx]:
+
+                    # Build text labels for every point
+                    df_chart = df_breakdown[['Period', 'Variant', metric_name]].copy()
+                    df_chart['_label'] = df_chart[metric_name].apply(
+                        lambda v: fmt_label(v, metric_name) if pd.notnull(v) else ""
+                    )
+
                     fig = px.line(
-                        df_breakdown,
+                        df_chart,
                         x='Period',
                         y=metric_name,
                         color='Variant',
+                        text='_label',          # ← % / $ / count on each point
                         markers=True,
                         title=metric_name,
                         labels={'Period': granularity, metric_name: metric_name}
                     )
 
-                    # Format Y axis
+                    # Position labels above markers
+                    fig.update_traces(
+                        textposition='top center',
+                        textfont=dict(size=11),
+                        hovertemplate='%{fullData.name}: %{text}<extra></extra>'
+                    )
+
+                    # Y-axis formatting
                     if is_rate(metric_name):
                         fig.update_layout(yaxis_ticksuffix='%', yaxis_tickformat='.1f')
                     elif is_currency(metric_name):
@@ -737,86 +782,61 @@ def render_date_breakdown(df_filtered, selected_variants, control_variant):
 
                     fig.update_layout(
                         legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-                        margin=dict(t=50, b=30, l=10, r=10),
+                        margin=dict(t=55, b=30, l=10, r=10),
                         hovermode='x unified'
-                    )
-                    fig.update_traces(
-                        hovertemplate='%{fullData.name}: %{y}<extra></extra>'
                     )
                     st.plotly_chart(fig, use_container_width=True)
 
     # ── TABLE ─────────────────────────────────────────────────────────
     if show_table:
-        display_cols = ['Period', 'Variant'] + selected_metrics
 
-        # Format for display
-        df_table = df_breakdown[display_cols].copy()
+        # Build all raw cols needed (rates + their counts)
+        raw_cols_needed = set()
+        for m in selected_metrics:
+            if is_rate(m):
+                num_col, den_col = RATE_COUNTS_MAP[m]
+                raw_cols_needed.add(num_col)
+                raw_cols_needed.add(den_col)
 
-        rate_cols = [m for m in selected_metrics if m in [
-            'Landing -> Registration', 'Landing -> Onboarding',
-            'Landing -> Payer (24h)', 'Reg -> Payer 0d', 'Registration -> Payer'
-        ]]
-        currency_cols = [m for m in selected_metrics if m in [
-            'ARPU', 'ARPPU', 'ARPU 0d', 'ARPPU 0d', 'Total Revenue'
-        ]]
-        int_cols = [m for m in selected_metrics if m in [
-            'Visitors', 'Registered Users', 'Onboarding Users',
-            'Payers', 'Payers 0d (Landing)'
-        ]]
+        all_needed = ['Period', 'Variant'] + list(raw_cols_needed) + selected_metrics
+        # keep only cols that actually exist in df_breakdown
+        all_needed = [c for c in all_needed if c in df_breakdown.columns]
+        df_rich = df_breakdown[list(dict.fromkeys(all_needed))].copy()  # deduplicated, ordered
 
-        format_dict = {}
-        for c in rate_cols:
-            format_dict[c] = '{:.2f}%'
-        for c in currency_cols:
-            format_dict[c] = '${:.2f}'
-        for c in int_cols:
-            format_dict[c] = '{:,.0f}'
+        # Apply rich formatting per cell
+        df_display = df_rich[['Period', 'Variant']].copy()
+        for m in selected_metrics:
+            df_display[m] = df_rich.apply(lambda row: fmt_cell(row, m), axis=1)
 
-        # Pivot option: show variants side-by-side per period
+        # ── Pivot option ─────────────────────────────────────────────
         pivot_view = st.checkbox("Pivot table (variants as columns)", value=True, key='date_breakdown_pivot')
 
         if pivot_view and len(selected_metrics) == 1:
             metric_name = selected_metrics[0]
-            df_pivot = df_table.pivot(index='Period', columns='Variant', values=metric_name)
+            df_pivot = df_display.pivot(index='Period', columns='Variant', values=metric_name)
             df_pivot.columns.name = None
-            df_pivot = df_pivot.reset_index()
-
-            # Format numeric values
-            if metric_name in rate_cols:
-                fmt = lambda x: f"{x:.2f}%" if pd.notnull(x) else "—"
-            elif metric_name in currency_cols:
-                fmt = lambda x: f"${x:.2f}" if pd.notnull(x) else "—"
-            else:
-                fmt = lambda x: f"{int(x):,}" if pd.notnull(x) else "—"
-
-            for col in df_pivot.columns[1:]:
-                df_pivot[col] = df_pivot[col].apply(fmt)
-
-            st.dataframe(df_pivot, hide_index=True, use_container_width=True)
+            st.dataframe(df_pivot.reset_index(), hide_index=True, use_container_width=True)
 
         elif pivot_view and len(selected_metrics) > 1:
-            # Multi-metric pivot: Period | Metric | Variant_A | Variant_B ...
-            melted = df_table.melt(id_vars=['Period', 'Variant'], value_vars=selected_metrics, var_name='Metric')
-            pivoted = melted.pivot_table(index=['Period', 'Metric'], columns='Variant', values='value', aggfunc='first')
+            # Period | Metric | Variant_A | Variant_B ...
+            melted = df_display.melt(
+                id_vars=['Period', 'Variant'],
+                value_vars=selected_metrics,
+                var_name='Metric'
+            )
+            pivoted = melted.pivot_table(
+                index=['Period', 'Metric'],
+                columns='Variant',
+                values='value',
+                aggfunc='first'
+            )
             pivoted.columns.name = None
-            pivoted = pivoted.reset_index()
-
-            # Color-code: highlight control column differently
-            def style_pivot(row):
-                styles = [''] * len(row)
-                return styles
-
-            st.dataframe(pivoted, hide_index=True, use_container_width=True)
+            st.dataframe(pivoted.reset_index(), hide_index=True, use_container_width=True)
 
         else:
-            # Flat table
-            styled = df_table.style
-            for col, fmt in format_dict.items():
-                styled = styled.format({col: fmt})
-            st.dataframe(styled, hide_index=True, use_container_width=True)
+            st.dataframe(df_display, hide_index=True, use_container_width=True)
 
     # ── Delta vs Control strip ────────────────────────────────────────
-    # Show period-level delta for non-control variants vs control
     test_variants_for_delta = [v for v in variants_to_show if v != control_variant]
 
     if test_variants_for_delta and len(selected_metrics) >= 1:
@@ -845,19 +865,40 @@ def render_date_breakdown(df_filtered, selected_variants, control_variant):
             if delta_rows:
                 df_delta = pd.concat(delta_rows, ignore_index=True)
 
+                # Label delta bars
+                suffix = '%' if is_rate(delta_metric) else (
+                    '$' if is_currency(delta_metric) else ''
+                )
+                df_delta['_dlabel'] = df_delta['Delta'].apply(
+                    lambda v: f"{v:+.2f}{suffix}" if pd.notnull(v) else ""
+                )
+
                 fig_delta = px.bar(
                     df_delta,
                     x='Period',
                     y='Delta',
                     color='Variant',
+                    text='_dlabel',
                     barmode='group',
-                    title=f"Period Delta: {delta_metric} (Variant - Control)",
+                    title=f"Period Delta: {delta_metric} (Variant − Control)",
                 )
+                fig_delta.update_traces(textposition='outside', textfont=dict(size=11))
                 fig_delta.add_hline(y=0, line_dash='dash', line_color='gray')
                 fig_delta.update_layout(hovermode='x unified')
                 st.plotly_chart(fig_delta, use_container_width=True)
 
-                st.dataframe(df_delta, hide_index=True, use_container_width=True)
+                # Delta table: show formatted values too
+                ctrl_col = f'{control_variant} (ctrl)'
+                df_delta_show = df_delta[['Period', 'Variant', ctrl_col, tv, 'Delta']].copy()
+                if is_rate(delta_metric):
+                    for c in [ctrl_col, tv]:
+                        df_delta_show[c] = df_delta_show[c].apply(lambda v: f"{v:.2f}%" if pd.notnull(v) else "—")
+                    df_delta_show['Delta'] = df_delta_show['Delta'].apply(lambda v: f"{v:+.2f}%" if pd.notnull(v) else "—")
+                elif is_currency(delta_metric):
+                    for c in [ctrl_col, tv]:
+                        df_delta_show[c] = df_delta_show[c].apply(lambda v: f"${v:.2f}" if pd.notnull(v) else "—")
+                    df_delta_show['Delta'] = df_delta_show['Delta'].apply(lambda v: f"${v:+.2f}" if pd.notnull(v) else "—")
+                st.dataframe(df_delta_show, hide_index=True, use_container_width=True)
 
 
 # ============================================================
