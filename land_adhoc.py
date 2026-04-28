@@ -1,181 +1,117 @@
-"""
-Cohort Quiz Analysis — окрема сторінка для глибокого когортного аналізу
-воронок mm-sq1-v1 та mf-sq1-v1.
-
-Що тут є
---------
-1. Drop-off per screen (скільки юзерів дійшли до кроку)
-2. Розподіл відповідей на конкретному екрані (з опціональним split multi-select)
-3. Cohort builder — фільтр по одній або декількох (screen, answer) парах
-   → повна funnel-таблиця для когорти vs решта (з стат значущістю)
-4. Cross-tab двох екранів: Sankey + Stacked bar
-5. Multi-step сегментація (back-back-back filters)
-
-Очікуваний CSV (long format) — формується запитом з bq_extract_guide.md секція 1.2 / 2.2:
-    user_id, landingId, flowId, screen_id, screen_order, question_text, answer_value, event_at
-
-Опційно: land_1.csv (той самий що в Home page) для повних бізнес-метрик.
-"""
-
 import streamlit as st
 import pandas as pd
-import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from scipy import stats
+import numpy as np
 from statsmodels.stats.proportion import proportions_ztest
 
-# ─────────────────────────────────────────────────────────────────────
-# Page config
-# ─────────────────────────────────────────────────────────────────────
+# --- Налаштування ---
 st.set_page_config(
-    page_title="Cohort Quiz Analysis",
-    page_icon="🧪",
+    page_title="Аналіз лендингів",
+    page_icon="🌍",
     layout="wide"
 )
 
-st.title("🧪 Cohort Quiz Analysis")
-st.caption(
-    "Глибокий когортний аналіз воронок **mm-sq1-v1** та **mf-sq1-v1**. "
-    "Завантаж long-format quiz CSV (з bq_extract_guide.md, секції 1.2 / 2.2). "
-    "Опційно — land_1.csv для розрахунку конверсій / ARPU по когортах."
-)
+# --- Константи ---
+DEFAULT_CSV_PATH = 'land_1.csv'
+DATE_COLS = ['created_at', 'profile_created_at', 'reg_at', 'fo_at', 'landing_at', 'order_created_at']
 
-# ─────────────────────────────────────────────────────────────────────
-# Constants
-# ─────────────────────────────────────────────────────────────────────
-SUPPORTED_LANDINGS = ['mm-sq1-v1', 'mf-sq1-v1']
-LAND1_DATE_COLS = ['created_at', 'profile_created_at', 'reg_at', 'fo_at',
-                   'landing_at', 'order_created_at']
+# --- 1. Завантаження та попередня обробка даних ---
 
-# Хардкодимо порядок екранів з screen_catalog (на випадок якщо в long немає screen_order)
-SCREEN_ORDER_MM = [
-    'gender', 'last-date', 'get-start', 'target', 'marital-status',
-    'interests', 'infographic', 'body', 'partner-age', 'birthdate',
-    'attracts', 'name', 'table', 'value', 'taboo', 'ideal-date',
-    'invest-time-dt', 'distance', 'loader', 'graph', 'email',
-    'password', 'congrats', 'profile-photo', 'location', 'about', 'done'
-]
-SCREEN_ORDER_MF = [
-    'decisions', 'lack', 'get-start', 'target', 'marital-status',
-    'interests', 'infographic', 'body', 'partner-height', 'age-range',
-    'birthdate', 'habits', 'pets', 'name', 'table', 'important-things',
-    'relationship', 'ideal-date', 'loader', 'graph', 'email', 'password',
-    'congrats', 'profile-photo', 'location', 'about', 'done'
-]
-DEFAULT_SCREEN_ORDER = {
-    'mm-sq1-v1': SCREEN_ORDER_MM,
-    'mf-sq1-v1': SCREEN_ORDER_MF,
-}
+@st.cache_data
+def load_data(file_path_or_buffer):
+    """Завантажує та попередньо обробляє дані."""
+    try:
+        df = pd.read_csv(file_path_or_buffer)
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        st.error(f"Error loading file: {e}")
+        return None
 
-# Які екрани вважаємо "interstitial" (не питання — там одна відповідь Continue)
-# Корисно для дефолту — щоб у dropdown питань не показувати їх
-INTERSTITIAL_SCREENS = {
-    'gender', 'get-start', 'infographic', 'table', 'graph',
-    'congrats', 'profile-photo', 'done'
-}
-
-# Multi-select екрани (csv_list / csv_list_mixed) — для них корисно сплітити по комі
-MULTI_SELECT_SCREENS = {
-    'mm-sq1-v1': {
-        'target', 'interests', 'body', 'attracts', 'value',
-        'taboo', 'location', 'about'
-    },
-    'mf-sq1-v1': {
-        'target', 'interests', 'important-things', 'ideal-date',
-        'location', 'about'
-    },
-}
-
-# ─────────────────────────────────────────────────────────────────────
-# Loaders
-# ─────────────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False)
-def load_quiz_long(file_or_buf) -> pd.DataFrame:
-    """Long quiz CSV: 1 row = user × screen × answer."""
-    df = pd.read_csv(file_or_buf)
-    required = {'user_id', 'landingId', 'screen_id', 'answer_value'}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}")
-
-    # Приводимо типи
-    df['user_id']      = df['user_id'].astype(str)
-    df['landingId']    = df['landingId'].astype(str)
-    df['screen_id']    = df['screen_id'].astype(str)
-    df['answer_value'] = df['answer_value'].fillna('').astype(str).str.strip()
-
-    if 'screen_order' in df.columns:
-        df['screen_order'] = pd.to_numeric(df['screen_order'], errors='coerce')
-
-    if 'event_at' in df.columns:
-        df['event_at'] = pd.to_datetime(df['event_at'], errors='coerce')
-
-    # Залишаємо тільки воронки які підтримуємо
-    df = df[df['landingId'].isin(SUPPORTED_LANDINGS)].copy()
-
-    # Defensive dedup: одна остання відповідь юзера на екран
-    sort_col = 'event_at' if 'event_at' in df.columns else None
-    if sort_col:
-        df = df.sort_values(sort_col)
-    df = df.drop_duplicates(subset=['user_id', 'landingId', 'screen_id'], keep='last')
-
-    return df
-
-
-@st.cache_data(show_spinner=False)
-def load_land1(file_or_buf) -> pd.DataFrame:
-    """land_1.csv — той самий формат що в основній сторінці."""
-    df = pd.read_csv(file_or_buf)
-    for col in LAND1_DATE_COLS:
+    # Перетворення дат (включаючи landing_at, order_created_at)
+    for col in DATE_COLS:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors='coerce')
+    
+    # Коригування валюти (ділимо на 100)
     if 'amount' in df.columns:
         df['amount'] = df['amount'] / 100.0
-    if 'user_id' in df.columns:
-        df['user_id'] = df['user_id'].astype(str)
+
+    # Логіка кластеризації продуктів
+    if 'id' in df.columns:
+        def assign_cluster(pkg_id):
+            if not isinstance(pkg_id, str): return 'other'
+            pkg_id = pkg_id.lower()
+            
+            if pkg_id in ['credits-1550-taxes-v4', 'credits-2950-taxes-v4', 'credits-595-taxes-v4']:
+                return 'credits'
+            if pkg_id in ['pkg-premium-advanced-taxes-ntf3-6m-v1', 'pkg-premium-advanced-taxes-ntfm25-6m-v1', 'pkg-premium-advanced-taxes-ntfm25-smart-6m-v1']:
+                return 'premium 6m'
+            if pkg_id == 'pkg-premium-gold-taxes-ntf3-3m':
+                return 'gold 3m'
+            if pkg_id == 'pkg-premium-gold-taxes-ntf3-6m':
+                return 'gold 6m'
+            if pkg_id == 'pkg-premium-gold-taxes-ntf3-v2':
+                return 'gold 1m'
+            if pkg_id in ['pkg-premium-intermidiate-taxes-ntf3-3m-v1', 'pkg-premium-intermidiate-taxes-ntfm25-3m-v1', 'pkg-premium-intermidiate-taxes-ntfm25-smart-3m-v1']:
+                return 'premium 3m'
+            if pkg_id in ['pkg-premium-standard-taxes-ntf3-1m-v7', 'pkg-premium-standard-taxes-ntfm25-1m-v7', 'pkg-premium-standard-taxes-ntfm25-smart-1m-v7']:
+                return 'premium 1m'
+            
+            return 'other'
+        
+        df['product_cluster'] = df['id'].apply(assign_cluster)
+    
     return df
 
+# --- 2. Визначення метрик ---
 
-# ─────────────────────────────────────────────────────────────────────
-# Metric helpers (узгоджені з Home page)
-# ─────────────────────────────────────────────────────────────────────
-def calculate_metrics(df: pd.DataFrame) -> dict:
-    """Повторює логіку Home page: visitors, reg, payers, ARPU 0d тощо."""
-    if df is None or df.empty:
-        return {
-            'Visitors': 0, 'Onboarding Users': 0, 'Registered Users': 0,
-            'Payers': 0, 'Payers (Day 0)': 0, 'Payers 0d (Landing)': 0,
-            'Total Revenue': 0.0, 'Revenue 0d (Landing)': 0.0,
-            'ARPU': 0.0, 'ARPPU': 0.0, 'ARPU 0d': 0.0, 'ARPPU 0d': 0.0,
-        }
+def calculate_metrics(df):
+    """Розраховує воронкові та фінансові метрики, включаючи показники День 0."""
 
-    visitors    = df['user_id'].nunique()
-    onboarding  = df[df['profile_created_at'].notnull()]['user_id'].nunique() if 'profile_created_at' in df.columns else 0
-    registered  = df[df['reg_at'].notnull()]['user_id'].nunique()              if 'reg_at' in df.columns              else 0
-    payers      = df[df['fo_at'].notnull()]['user_id'].nunique()                if 'fo_at' in df.columns                else 0
-
-    payers_d0 = 0
+    # 1. Базові підрахунки
+    visitors = df['user_id'].nunique()
+    onboarding = df[df['profile_created_at'].notnull()]['user_id'].nunique() if 'profile_created_at' in df.columns else 0
+    registered = df[df['reg_at'].notnull()]['user_id'].nunique() if 'reg_at' in df.columns else 0
+    payers = df[df['fo_at'].notnull()]['user_id'].nunique() if 'fo_at' in df.columns else 0
+    
+    # Платники День 0 (застаріле: fo_at - reg_at <= 24h)
     if 'fo_at' in df.columns and 'reg_at' in df.columns:
-        sub = df.dropna(subset=['fo_at', 'reg_at'])
-        payers_d0 = sub[(sub['fo_at'] - sub['reg_at']) <= pd.Timedelta(hours=24)]['user_id'].nunique()
+        df_payers = df.dropna(subset=['fo_at', 'reg_at'])
+        df_payers_d0 = df_payers[(df_payers['fo_at'] - df_payers['reg_at']) <= pd.Timedelta(hours=24)]
+        payers_d0 = df_payers_d0['user_id'].nunique()
+    else:
+        payers_d0 = 0
 
-    payers_0d_land = 0
+    # 2. Фінанси
+    total_amount = df['amount'].sum() if 'amount' in df.columns else 0
+
+    # ARPU (Дохід / Відвідувачі) - стандартний
+    arpu = total_amount / visitors if visitors > 0 else 0
+
+    # ARPPU (Дохід / Платники) - стандартний
+    arppu = total_amount / payers if payers > 0 else 0
+
+    # 3. Нові метрики День 0 (на основі landing_at)
+    payers_0d_land_count = 0
+    rev_0d_land = 0
+    
     if 'fo_at' in df.columns and 'landing_at' in df.columns:
-        sub = df.dropna(subset=['fo_at', 'landing_at'])
-        payers_0d_land = sub[(sub['fo_at'] - sub['landing_at']) <= pd.Timedelta(hours=24)]['user_id'].nunique()
+        df_pay_land = df.dropna(subset=['fo_at', 'landing_at'])
+        payers_0d_land_count = df_pay_land[(df_pay_land['fo_at'] - df_pay_land['landing_at']) <= pd.Timedelta(hours=24)]['user_id'].nunique()
+        
+    if 'amount' in df.columns and 'order_created_at' in df.columns and 'landing_at' in df.columns:
+         df_ord = df.dropna(subset=['order_created_at', 'landing_at', 'amount'])
+         df_ord_0d = df_ord[(df_ord['order_created_at'] - df_ord['landing_at']) <= pd.Timedelta(hours=24)]
+         rev_0d_land = df_ord_0d['amount'].sum()
 
-    total_amount = df['amount'].sum() if 'amount' in df.columns else 0.0
+    # ARPU 0d ($): Дохід 0d / Зареєстровані користувачі
+    arpu_0d_val = rev_0d_land / registered if registered > 0 else 0
 
-    rev_0d_land = 0.0
-    if {'amount', 'order_created_at', 'landing_at'}.issubset(df.columns):
-        sub = df.dropna(subset=['order_created_at', 'landing_at', 'amount'])
-        rev_0d_land = sub[(sub['order_created_at'] - sub['landing_at']) <= pd.Timedelta(hours=24)]['amount'].sum()
-
-    arpu      = total_amount / visitors    if visitors    > 0 else 0
-    arppu     = total_amount / payers      if payers      > 0 else 0
-    arpu_0d   = rev_0d_land / registered   if registered  > 0 else 0
-    arppu_0d  = rev_0d_land / payers_0d_land if payers_0d_land > 0 else 0
+    # ARPPU 0d ($): Дохід 0d / Платники 0d (Landing)
+    arppu_0d_val = rev_0d_land / payers_0d_land_count if payers_0d_land_count > 0 else 0
 
     return {
         'Visitors': visitors,
@@ -183,698 +119,1178 @@ def calculate_metrics(df: pd.DataFrame) -> dict:
         'Registered Users': registered,
         'Payers': payers,
         'Payers (Day 0)': payers_d0,
-        'Payers 0d (Landing)': payers_0d_land,
-        'Total Revenue': float(total_amount),
-        'Revenue 0d (Landing)': float(rev_0d_land),
-        'ARPU': arpu, 'ARPPU': arppu,
-        'ARPU 0d': arpu_0d, 'ARPPU 0d': arppu_0d,
+        'Total Revenue': total_amount,
+        'ARPU': arpu,
+        'ARPPU': arppu,
+        'Payers 0d (Landing)': payers_0d_land_count,
+        'Revenue 0d (Landing)': rev_0d_land,
+        'ARPU 0d': arpu_0d_val,
+        'ARPPU 0d': arppu_0d_val
     }
 
-
-def conversion_rates(m: dict) -> dict:
-    v = m['Visitors']; r = m['Registered Users']
+def get_conversion_rates(metrics):
+    """Розраховує коефіцієнти конверсії на основі словника метрик."""
+    visitors = metrics['Visitors']
+    onboarding = metrics['Onboarding Users']
+    registered = metrics['Registered Users']
+    payers = metrics['Payers']
+    
+    conv_landing_onboarding = (onboarding / visitors * 100) if visitors > 0 else 0
+    conv_landing_registration = (registered / visitors * 100) if visitors > 0 else 0
+    conv_onboarding_registration = (registered / onboarding * 100) if onboarding > 0 else 0
+    conv_registration_payer = (payers / registered * 100) if registered > 0 else 0
+    conv_registration_payer_d0 = (metrics['Payers (Day 0)'] / registered * 100) if registered > 0 else 0
+    conv_reg_payer_0d_land = (metrics['Payers 0d (Landing)'] / registered * 100) if registered > 0 else 0
+    conv_land_payer_24h = (metrics['Payers 0d (Landing)'] / visitors * 100) if visitors > 0 else 0
+    
     return {
-        'Landing → Onboarding':   100 * m['Onboarding Users']    / v if v else 0,
-        'Landing → Registration': 100 * r                         / v if v else 0,
-        'Registration → Payer':   100 * m['Payers']               / r if r else 0,
-        'Reg → Payer 0d':         100 * m['Payers 0d (Landing)'] / r if r else 0,
-        'Landing → Payer (24h)':  100 * m['Payers 0d (Landing)'] / v if v else 0,
+        'Landing -> Onboarding': conv_landing_onboarding,
+        'Landing -> Registration': conv_landing_registration,
+        'Onboarding -> Registration': conv_onboarding_registration,
+        'Registration -> Payer': conv_registration_payer,
+        'Registration -> Payer D0': conv_registration_payer_d0,
+        'Reg -> Payer 0d': conv_reg_payer_0d_land,
+        'Landing -> Payer (24h)': conv_land_payer_24h,
     }
 
+# --- 3. Статистичні розрахунки ---
 
-# ─────────────────────────────────────────────────────────────────────
-# Statistical helpers (Bayesian + Frequentist)
-# ─────────────────────────────────────────────────────────────────────
-def bayes_proportion(succ_c, n_c, succ_v, n_v, n_samples=10000):
+@st.cache_data
+def run_bayesian_simulation_proportion(success_c, n_c, success_v, n_v, n_samples=10000):
+    """Байєсівська симуляція для пропорцій (Beta-розподіл)."""
+    n_c, success_c = max(0, int(n_c)), max(0, int(success_c))
+    n_v, success_v = max(0, int(n_v)), max(0, int(success_v))
+    
     if n_c == 0 or n_v == 0: return 0.5, 0.0
-    succ_c, succ_v = min(succ_c, n_c), min(succ_v, n_v)
-    pc = np.random.beta(1 + succ_c, 1 + (n_c - succ_c), n_samples)
-    pv = np.random.beta(1 + succ_v, 1 + (n_v - succ_v), n_samples)
-    prob = float(np.mean(pv > pc))
-    mc   = float(np.mean(pc))
-    uplift = (np.mean(pv) - mc) / mc * 100 if mc > 0 else 0.0
-    return prob, uplift
-
-
-def freq_proportion(succ_c, n_c, succ_v, n_v):
-    if n_c == 0 or n_v == 0: return 1.0, 0.0
+    if success_c > n_c: success_c = n_c
+    if success_v > n_v: success_v = n_v
+        
     try:
-        _, pval = proportions_ztest([succ_v, succ_c], [n_v, n_c], alternative='two-sided')
-        rc = succ_c / n_c; rv = succ_v / n_v
-        uplift = (rv - rc) / rc * 100 if rc > 0 else 0.0
-        return float(pval), float(uplift)
+        posterior_c = np.random.beta(1 + success_c, 1 + (n_c - success_c), n_samples)
+        posterior_v = np.random.beta(1 + success_v, 1 + (n_v - success_v), n_samples)
+        prob_beat = np.mean(posterior_v > posterior_c)
+        mean_c = np.mean(posterior_c)
+        uplift = (np.mean(posterior_v) - mean_c) / mean_c * 100 if mean_c > 0 else 0.0
+        return prob_beat, uplift
     except Exception:
+        return 0.5, 0.0
+
+@st.cache_data
+def run_bayesian_simulation_revenue(data_c, data_v, n_samples=10000):
+    """Байєсівська симуляція для середніх значень (нормальний розподіл)."""
+    if len(data_c) < 2 or len(data_v) < 2: return 0.5, 0.0
+
+    mu_c, std_c = np.mean(data_c), np.std(data_c, ddof=1)
+    mu_v, std_v = np.mean(data_v), np.std(data_v, ddof=1)
+    
+    sem_c = std_c / np.sqrt(len(data_c))
+    sem_v = std_v / np.sqrt(len(data_v))
+    
+    posterior_c = np.random.normal(mu_c, sem_c, n_samples)
+    posterior_v = np.random.normal(mu_v, sem_v, n_samples)
+    
+    prob_beat = np.mean(posterior_v > posterior_c)
+    uplift = np.mean(posterior_v) - np.mean(posterior_c)
+    
+    return prob_beat, uplift
+
+def run_frequentist_tests(success_c, n_c, success_v, n_v):
+    """Z-тест для пропорцій."""
+    if n_c == 0 or n_v == 0: return 1.0, 0.0
+    count = np.array([success_v, success_c])
+    nobs = np.array([n_v, n_c])
+    try:
+        stat, pval = proportions_ztest(count, nobs, alternative='two-sided')
+        rate_c = success_c / n_c
+        rate_v = success_v / n_v
+        uplift = (rate_v - rate_c) / rate_c * 100 if rate_c > 0 else 0.0
+        return pval, uplift
+    except:
         return 1.0, 0.0
 
+def run_frequentist_means(data_c, data_v):
+    """T-тест для середніх значень."""
+    if len(data_c) < 2 or len(data_v) < 2: return 1.0, 0.0
+    try:
+        stat, pval = stats.ttest_ind(data_v, data_c, equal_var=False)
+        uplift = np.mean(data_v) - np.mean(data_c)
+        return pval, uplift
+    except:
+        return 1.0, 0.0
 
-def verdict(stat_val, uplift, method, n_c, n_v):
-    if n_c < 100 or n_v < 100: return "⚠️ Insufficient data"
-    if method.startswith('Bayes'):
-        if stat_val > 0.95: return "🚀 Winner (>95%)"
-        if stat_val < 0.05: return "📉 Loser (<5%)"
-        return "⚖️ Inconclusive"
+def run_statistics(df, df_c, control_variant, variants, method='Bayesian'):
+    """Запускає тести за обраним методом, порівняння проти контрольного df."""
+    results = {}
+    
+    m_control = calculate_metrics(df_c)
+    
+    def get_rev_vec(dframe):
+        reg = dframe[dframe['reg_at'].notnull()]['user_id'].unique()
+        pay = dframe.groupby('user_id')['amount'].sum().reset_index()
+        merged = pd.Series(reg, name='user_id').to_frame().merge(pay, on='user_id', how='left').fillna(0)
+        return merged['amount'].values, dframe.dropna(subset=['fo_at'])['amount'].values
+
+    def get_rev_0d_vec(dframe):
+        if 'landing_at' not in dframe.columns or 'order_created_at' not in dframe.columns:
+            return np.array([]), np.array([])
+            
+        reg_users = dframe[dframe['reg_at'].notnull()]['user_id'].unique()
+        
+        df_ord = dframe.dropna(subset=['order_created_at', 'landing_at', 'amount'])
+        df_ord_0d = df_ord[(df_ord['order_created_at'] - df_ord['landing_at']) <= pd.Timedelta(hours=24)]
+        
+        pay_0d = df_ord_0d.groupby('user_id')['amount'].sum().reset_index()
+        
+        merged_arpu = pd.Series(reg_users, name='user_id').to_frame().merge(pay_0d, on='user_id', how='left').fillna(0)
+        
+        return merged_arpu['amount'].values, pay_0d['amount'].values
+
+    vec_arpu_c, vec_arppu_c = get_rev_vec(df_c)
+    vec_arpu_0d_c, vec_arppu_0d_c = get_rev_0d_vec(df_c)
+    
+    n_vis_c = m_control['Visitors']
+    n_reg_c = m_control['Registered Users']
+
+    for v in variants:
+        df_v = df[df['landingId'] == v]
+        m_v = calculate_metrics(df_v)
+        vec_arpu_v, vec_arppu_v = get_rev_vec(df_v)
+        vec_arpu_0d_v, vec_arppu_0d_v = get_rev_0d_vec(df_v)
+        
+        n_vis_v = m_v['Visitors']
+        n_reg_v = m_v['Registered Users']
+        
+        tests = {}
+        
+        if method == 'Frequentist (Classical)':
+            tests['Landing -> Onboarding'] = run_frequentist_tests(
+                m_v['Onboarding Users'], n_vis_v, m_control['Onboarding Users'], n_vis_c)
+            tests['Landing -> Registration'] = run_frequentist_tests(
+                m_v['Registered Users'], n_vis_v, m_control['Registered Users'], n_vis_c)
+            tests['Registration -> Payer'] = run_frequentist_tests(
+                m_v['Payers'], n_reg_v, m_control['Payers'], n_reg_c)
+            tests['Reg -> Payer 0d'] = run_frequentist_tests(
+                m_v['Payers 0d (Landing)'], n_reg_v, m_control['Payers 0d (Landing)'], n_reg_c)
+            tests['Landing -> Payer (24h)'] = run_frequentist_tests(
+                m_v['Payers 0d (Landing)'], n_vis_v, m_control['Payers 0d (Landing)'], n_vis_c)
+                
+            tests['ARPU'] = run_frequentist_means(vec_arpu_c, vec_arpu_v)
+            tests['ARPPU'] = run_frequentist_means(vec_arppu_c, vec_arppu_v)
+            tests['ARPU 0d'] = run_frequentist_means(vec_arpu_0d_c, vec_arpu_0d_v)
+            tests['ARPPU 0d'] = run_frequentist_means(vec_arppu_0d_c, vec_arppu_0d_v)
+            
+        else: # Bayesian
+            tests['Landing -> Onboarding'] = run_bayesian_simulation_proportion(
+                m_control['Onboarding Users'], n_vis_c, m_v['Onboarding Users'], n_vis_v)
+            tests['Landing -> Registration'] = run_bayesian_simulation_proportion(
+                m_control['Registered Users'], n_vis_c, m_v['Registered Users'], n_vis_v)
+            tests['Registration -> Payer'] = run_bayesian_simulation_proportion(
+                m_control['Payers'], n_reg_c, m_v['Payers'], n_reg_v)
+            tests['Reg -> Payer 0d'] = run_bayesian_simulation_proportion(
+                m_control['Payers 0d (Landing)'], n_reg_c, m_v['Payers 0d (Landing)'], n_reg_v)
+            tests['Landing -> Payer (24h)'] = run_bayesian_simulation_proportion(
+                m_control['Payers 0d (Landing)'], n_vis_c, m_v['Payers 0d (Landing)'], n_vis_v)
+                
+            tests['ARPU'] = run_bayesian_simulation_revenue(vec_arpu_c, vec_arpu_v)
+            tests['ARPPU'] = run_bayesian_simulation_revenue(vec_arppu_c, vec_arppu_v)
+            tests['ARPU 0d'] = run_bayesian_simulation_revenue(vec_arpu_0d_c, vec_arpu_0d_v)
+            tests['ARPPU 0d'] = run_bayesian_simulation_revenue(vec_arppu_0d_c, vec_arppu_0d_v)
+        
+        results[v] = tests
+        
+    return results
+
+def generate_comprehensive_summary(df, df_c, control_variant, variants, method, allowed_dims=None):
+    """
+    Сканує виміри (Загальний, 1-рівень, 2-рівень) для пошуку значущих знахідок.
+    Повертає список структурованих знахідок.
+    """
+    findings = []
+    
+    metrics = [
+        'Landing -> Onboarding', 'Landing -> Registration', 'Registration -> Payer',
+        'Reg -> Payer 0d', 'Landing -> Payer (24h)', 'ARPU', 'ARPPU', 'ARPU 0d', 'ARPPU 0d'
+    ]
+    
+    if allowed_dims is not None:
+        cat_cols = allowed_dims
+    else:
+        exclude_cols = ['user_id', 'landingId', 'amount', 'id', 'product_cluster'] + DATE_COLS
+        cat_cols = [c for c in df.columns if c not in exclude_cols and pd.api.types.is_string_dtype(df[c])]
+    
+    stats_global = run_statistics(df, df_c, control_variant, variants, method=method)
+    
+    def _get_metric_value(m_dict, c_dict, metric_name):
+        """Get absolute value string (num/den or $value) for a metric."""
+        is_mon = 'ARP' in metric_name
+        if metric_name == 'Landing -> Onboarding':
+            num, den = int(m_dict['Onboarding Users']), int(m_dict['Visitors'])
+            rate = c_dict.get(metric_name, 0)
+            return f"{rate:.2f}% ({num:,}/{den:,})"
+        elif metric_name == 'Landing -> Registration':
+            num, den = int(m_dict['Registered Users']), int(m_dict['Visitors'])
+            rate = c_dict.get(metric_name, 0)
+            return f"{rate:.2f}% ({num:,}/{den:,})"
+        elif metric_name == 'Registration -> Payer':
+            num, den = int(m_dict['Payers']), int(m_dict['Registered Users'])
+            rate = c_dict.get(metric_name, 0)
+            return f"{rate:.2f}% ({num:,}/{den:,})"
+        elif metric_name == 'Reg -> Payer 0d':
+            num, den = int(m_dict['Payers 0d (Landing)']), int(m_dict['Registered Users'])
+            rate = c_dict.get(metric_name, 0)
+            return f"{rate:.2f}% ({num:,}/{den:,})"
+        elif metric_name == 'Landing -> Payer (24h)':
+            num, den = int(m_dict['Payers 0d (Landing)']), int(m_dict['Visitors'])
+            rate = c_dict.get(metric_name, 0)
+            return f"{rate:.2f}% ({num:,}/{den:,})"
+        elif metric_name == 'ARPU':
+            return f"${m_dict['ARPU']:.2f} (${m_dict['Total Revenue']:,.0f}/{int(m_dict['Visitors']):,})"
+        elif metric_name == 'ARPPU':
+            return f"${m_dict['ARPPU']:.2f} (${m_dict['Total Revenue']:,.0f}/{int(m_dict['Payers']):,})"
+        elif metric_name == 'ARPU 0d':
+            return f"${m_dict['ARPU 0d']:.2f} (${m_dict['Revenue 0d (Landing)']:,.0f}/{int(m_dict['Registered Users']):,})"
+        elif metric_name == 'ARPPU 0d':
+            payers_0d = int(m_dict['Payers 0d (Landing)'])
+            return f"${m_dict['ARPPU 0d']:.2f} (${m_dict['Revenue 0d (Landing)']:,.0f}/{payers_0d:,})"
+        return "N/A"
+
+    def parse_stats(res_stats, segment_name, counts, seg_df, seg_df_c):
+        for v in variants:
+            res = res_stats.get(v, {})
+            
+            m_ctrl_seg = calculate_metrics(seg_df_c)
+            c_ctrl_seg = get_conversion_rates(m_ctrl_seg)
+            
+            df_v_seg = seg_df[seg_df['landingId'] == v]
+            m_var_seg = calculate_metrics(df_v_seg)
+            c_var_seg = get_conversion_rates(m_var_seg)
+            
+            for m in metrics:
+                val, uplift = res.get(m, (0.5, 0.0) if method.startswith('Bayesian') else (1.0, 0.0))
+                
+                is_sig = False
+                confidence_str = ""
+                
+                if method.startswith('Bayesian'):
+                    if val > 0.95: 
+                        is_sig = True
+                        confidence_str = f"Prob {val:.1%}"
+                        res_type = 'winner'
+                    elif val < 0.05:
+                        is_sig = True
+                        confidence_str = f"Prob {val:.1%}"
+                        res_type = 'loser'
+                else:
+                    if val < 0.05:
+                        is_sig = True
+                        confidence_str = f"p={val:.4f}"
+                        res_type = 'winner' if uplift > 0 else 'loser'
+                
+                if is_sig:
+                    score = abs(uplift)
+                    
+                    ctrl_val_str = _get_metric_value(m_ctrl_seg, c_ctrl_seg, m)
+                    var_val_str = _get_metric_value(m_var_seg, c_var_seg, m)
+                    
+                    findings.append({
+                        'metric': m,
+                        'segment': segment_name,
+                        'variant': v,
+                        'result': res_type,
+                        'uplift': uplift,
+                        'confidence': confidence_str,
+                        'score': score,
+                        'obs': counts.get(v, 0),
+                        'control_val': ctrl_val_str,
+                        'variant_val': var_val_str,
+                    })
+
+    def get_counts(dframe):
+        return dframe['landingId'].value_counts().to_dict()
+
+    parse_stats(stats_global, "Global (All Traffic)", get_counts(df), df, df_c)
+    
+    for col in cat_cols:
+        top_vals = df[col].value_counts().nlargest(5).index.tolist()
+        for val in top_vals:
+            seg_name = f"{col}={val}"
+            sub_df = df[df[col] == val]
+            sub_df_c = df_c[df_c[col] == val]
+            
+            if not sub_df.empty and not sub_df_c.empty:
+                s_res = run_statistics(sub_df, sub_df_c, control_variant, variants, method=method)
+                parse_stats(s_res, seg_name, get_counts(sub_df), sub_df, sub_df_c)
+
+    priority_cols = ['country', 'platform_name', 'device_model', 'os','source']
+    selected_dims = [c for c in priority_cols if c in cat_cols]
+    for c in cat_cols:
+        if c not in selected_dims: selected_dims.append(c)
+    
+    dims_2 = selected_dims[:2]
+    
+    if len(dims_2) == 2:
+        c1, c2 = dims_2[0], dims_2[1]
+        top_vals_1 = df[c1].value_counts().nlargest(3).index.tolist()
+        top_vals_2 = df[c2].value_counts().nlargest(3).index.tolist()
+        
+        for v1 in top_vals_1:
+            for v2 in top_vals_2:
+                seg_name = f"{c1}={v1} & {c2}={v2}"
+                sub_df = df[(df[c1] == v1) & (df[c2] == v2)]
+                sub_df_c = df_c[(df_c[c1] == v1) & (df_c[c2] == v2)]
+                
+                if not sub_df.empty and not sub_df_c.empty:
+                     s_res = run_statistics(sub_df, sub_df_c, control_variant, variants, method=method)
+                     parse_stats(s_res, seg_name, get_counts(sub_df), sub_df, sub_df_c)
+
+    findings.sort(key=lambda x: x['obs'], reverse=True)
+    
+    return findings
+
+def render_summary_widget(findings, control_var):
+    st.markdown("### 🎯 Автоматичні інсайти (значущі знахідки)")
+
+    if not findings:
+        st.info("ℹ️ Статистично значущих знахідок по основних сегментах не виявлено.")
+        return
+
+    c_f_col, _ = st.columns([1, 2])
+    cat_filter = c_f_col.radio("Тип метрики", ['Всі', 'Монетарні', 'Конверсії'], horizontal=True)
+
+    filtered_findings = []
+    for f in findings:
+        is_mon = 'Ar' in f['metric'] or 'Rev' in f['metric'] or 'AR' in f['metric']
+        if cat_filter == 'Монетарні' and not is_mon: continue
+        if cat_filter == 'Конверсії' and is_mon: continue
+        filtered_findings.append(f)
+
+    if not filtered_findings:
+        st.info(f"Знахідок для категорії '{cat_filter}' не знайдено.")
+        return
+
+    wins = [f for f in filtered_findings if f['result'] == 'winner']
+    losses = [f for f in filtered_findings if f['result'] == 'loser']
+
+    wins.sort(key=lambda x: x['obs'], reverse=True)
+    losses.sort(key=lambda x: x['obs'], reverse=True)
+
+    def clean_name(s):
+        if not isinstance(s, str): return str(s)
+        return s.split('-')[-1]
+
+    def format_df(f_list):
+        if not f_list: return pd.DataFrame()
+        data = []
+        for f in f_list:
+            lift_s = f"{f['uplift']:+.1f}%" if 'Conv' in f['metric'] or 'Reg' in f['metric'] or 'Landing' in f['metric'] else f"{f['uplift']:+.2f}"
+            if 'Ar' in f['metric'] or 'Rev' in f['metric'] or 'AR' in f['metric']:
+                 if '%' not in lift_s: lift_s = f"${f['uplift']:+.2f}"
+            
+            v_short = clean_name(f['variant'])
+            c_short = clean_name(control_var)
+            seg_s = f"{f['segment']} ({v_short} vs {c_short})"
+            
+            data.append({
+                "Metric": f['metric'],
+                "Segment": seg_s,
+                "Control": f.get('control_val', 'N/A'),
+                "Variant": f.get('variant_val', 'N/A'),
+                "Lift": lift_s,
+                "Stat": f['confidence'],
+            })
+        return pd.DataFrame(data)
+
+    c1, c2 = st.columns(2)
+    
+    with c1:
+        st.error("📉 Значущі втрати (V < Контроль)")
+        if losses:
+            df_loss = format_df(losses)
+            st.dataframe(
+                df_loss.style.map(lambda x: 'color: red', subset=['Lift']),
+                width="stretch",
+                hide_index=True
+            )
+        else:
+            st.markdown("*Значущих втрат не виявлено.*")
+
+    with c2:
+        st.success("🚀 Значущі перемоги (V > Контроль)")
+        if wins:
+            df_win = format_df(wins)
+            st.dataframe(
+                df_win.style.map(lambda x: 'color: green', subset=['Lift']),
+                width="stretch",
+                hide_index=True
+            )
+        else:
+            st.markdown("*Значущих перемог не виявлено.*")
+    
+    st.markdown("---")
+
+# --- Логіка вердикту ---
+def get_stat_verdict(stat_val, uplift, method, n_c, n_v):
+    if n_c < 100 or n_v < 100:
+        return "⚠️ Недостатньо даних"
+    
+    is_bayesian = method.startswith('Bayesian')
+    
+    if is_bayesian:
+        if stat_val > 0.95: return "🚀 Переможець з високою впевненістю (>95%)"
+        if stat_val < 0.05: return "📉 Програш з високою впевненістю (<5%)"
+        return "⚖️ Неоднозначно"
     else:
         if stat_val < 0.05:
-            return "✅ Winner (sig)" if uplift > 0 else "❌ Loser (sig)"
-        return "🤷 No diff"
+            if uplift > 0: return "✅ Значущий результат (Переможець)"
+            return "❌ Значущий результат (Програш)"
+        return "🤷 Різниці немає"
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Multi-select utilities
-# ─────────────────────────────────────────────────────────────────────
-def explode_multi(df_screen: pd.DataFrame, separator: str = ',') -> pd.DataFrame:
-    """Розбиває answer_value 'a, b, c' на 3 рядки. Корисно для csv_list екранів."""
-    out = df_screen.copy()
-    out['answer_value'] = (
-        out['answer_value']
-        .fillna('')
-        .astype(str)
-        .str.split(separator)
-    )
-    out = out.explode('answer_value')
-    out['answer_value'] = out['answer_value'].astype(str).str.strip()
-    out = out[out['answer_value'] != '']
-    return out
+# ============================================================
+# --- Розбивка за датами ---
+# ============================================================
 
+# Відповідність кожної метрики → (числівник, знаменник) з _calc_row
+RATE_COUNTS_MAP = {
+    'Landing -> Registration':  ('Registered Users',       'Visitors'),
+    'Landing -> Onboarding':    ('Onboarding Users',        'Visitors'),
+    'Landing -> Payer (24h)':   ('Payers 0d (Landing)',     'Visitors'),
+    'Reg -> Payer 0d':          ('Payers 0d (Landing)',     'Registered Users'),
+    'Registration -> Payer':    ('Payers',                  'Registered Users'),
+}
 
-def is_multi_select(landing_id: str, screen_id: str) -> bool:
-    return screen_id in MULTI_SELECT_SCREENS.get(landing_id, set())
+def render_date_breakdown(df_filtered, selected_variants, control_variant):
+    """
+    Відображає розбивку за датами нижче блоку загальних метрик по варіантах.
+    Графіки: % мітки на кожній точці даних.
+    Таблиця: коефіцієнт + сирі підрахунки (числ/знам) у кожній клітинці.
+    """
 
+    st.subheader("📅 Розбивка за датами")
 
-# ─────────────────────────────────────────────────────────────────────
-# Sidebar — data sources
-# ─────────────────────────────────────────────────────────────────────
-st.sidebar.title("📥 Data Sources")
+    if 'landing_at' not in df_filtered.columns:
+        st.warning("Колонка `landing_at` не знайдена. Розбивка за датами потребує цю колонку.")
+        return
 
-st.sidebar.markdown("**Quiz events (long format)**")
-quiz_file = st.sidebar.file_uploader(
-    "Upload quiz_long.csv",
-    type=['csv'],
-    key='quiz_csv',
-    help="Колонки: user_id, landingId, screen_id, answer_value, [screen_order], [event_at]"
-)
+    df_dated = df_filtered.dropna(subset=['landing_at']).copy()
+    if df_dated.empty:
+        st.warning("Немає рядків з валідним `landing_at`.")
+        return
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("**land_1.csv (опційно)**")
-land1_file = st.sidebar.file_uploader(
-    "Upload land_1.csv",
-    type=['csv'],
-    key='land1_csv',
-    help="Той самий формат що на головній сторінці. Без нього — тільки drop-off і cross-tab без бізнес-метрик."
-)
+    # ── Рядок керування ───────────────────────────────────────────────
+    col_gran, col_metric, col_dates = st.columns([1, 2, 2])
 
-# Завантажуємо
-df_quiz = None
-df_land = None
-
-if quiz_file is not None:
-    try:
-        df_quiz = load_quiz_long(quiz_file)
-        st.sidebar.success(f"✅ Quiz: {len(df_quiz):,} rows / {df_quiz['user_id'].nunique():,} users")
-    except Exception as e:
-        st.sidebar.error(f"Quiz load error: {e}")
-
-if land1_file is not None:
-    try:
-        df_land = load_land1(land1_file)
-        st.sidebar.success(f"✅ land_1: {len(df_land):,} rows / {df_land['user_id'].nunique():,} users")
-    except Exception as e:
-        st.sidebar.error(f"land_1 load error: {e}")
-
-# ─────────────────────────────────────────────────────────────────────
-# Early exit якщо нема quiz даних
-# ─────────────────────────────────────────────────────────────────────
-if df_quiz is None or df_quiz.empty:
-    st.info(
-        "👈 Завантаж long-format quiz CSV у сайдбарі.\n\n"
-        "Очікувані колонки: `user_id`, `landingId`, `screen_id`, `answer_value`. "
-        "Опційно: `screen_order`, `event_at`, `flowId`, `question_text`.\n\n"
-        "SQL для extract'а — в `bq_extract_guide.md`, секції 1.2 (mm) та 2.2 (mf)."
-    )
-    with st.expander("ℹ️ Швидкий приклад SQL для extract"):
-        st.code("""
-WITH raw_quiz AS (
-  SELECT
-    user_id,
-    created_at AS event_at,
-    (SELECT value FROM UNNEST(params) WHERE key='landingId')   AS landingId,
-    (SELECT value FROM UNNEST(params) WHERE key='pageName')    AS screen_id,
-    SAFE_CAST((SELECT value FROM UNNEST(params) WHERE key='pageNumber') AS INT64) AS screen_order,
-    (SELECT value FROM UNNEST(params) WHERE key='action')      AS answer_value
-  FROM `gdx-prod-3caeb166.rawdata.analytics_events`
-  WHERE DATE(created_at) BETWEEN '2026-04-01' AND '2026-04-27'
-    AND name = 'user_action'
-    AND (SELECT value FROM UNNEST(params) WHERE key='landingId') IN ('mm-sq1-v1','mf-sq1-v1')
-    AND user_id IS NOT NULL AND user_id != ''
-)
-SELECT * FROM raw_quiz
-QUALIFY ROW_NUMBER() OVER (PARTITION BY user_id, landingId, screen_id ORDER BY event_at DESC)=1
-""", language='sql')
-    st.stop()
-
-# ─────────────────────────────────────────────────────────────────────
-# Top-level controls — flow + global filters
-# ─────────────────────────────────────────────────────────────────────
-available_landings = [v for v in SUPPORTED_LANDINGS if v in df_quiz['landingId'].unique()]
-
-ctop = st.columns([1, 2, 2])
-with ctop[0]:
-    flow = st.selectbox("Flow", available_landings, index=0)
-
-screen_order = DEFAULT_SCREEN_ORDER[flow]
-df_q = df_quiz[df_quiz['landingId'] == flow].copy()
-
-# Додаємо/нормалізуємо screen_order на основі catalog якщо в long немає
-if 'screen_order' not in df_q.columns or df_q['screen_order'].isna().all():
-    order_map = {s: i + 1 for i, s in enumerate(screen_order)}
-    df_q['screen_order'] = df_q['screen_id'].map(order_map)
-
-# Фільтрація land_1 по тій самій воронці
-df_l = None
-if df_land is not None and 'landingId' in df_land.columns:
-    df_l = df_land[df_land['landingId'] == flow].copy()
-
-with ctop[1]:
-    if df_l is not None and 'landing_at' in df_l.columns and df_l['landing_at'].notna().any():
-        min_d = df_l['landing_at'].min().date()
-        max_d = df_l['landing_at'].max().date()
-        date_range = st.date_input(
-            "Date range (за landing_at з land_1)",
-            value=(min_d, max_d),
-            min_value=min_d, max_value=max_d
+    with col_gran:
+        granularity = st.selectbox(
+            "Гранулярність",
+            ['День', 'Тиждень', 'Місяць'],
+            index=0,
+            key='date_breakdown_gran'
         )
-    else:
-        date_range = None
 
-with ctop[2]:
-    apply_country_filter = False
-    countries = []
-    if df_l is not None and 'country' in df_l.columns:
-        all_c = sorted(df_l['country'].dropna().unique())
-        if all_c:
-            sel_all = st.checkbox("Усі країни", value=True)
-            if not sel_all:
-                countries = st.multiselect("Countries", all_c)
-                apply_country_filter = True
-
-# Apply land_1 filters and shrink quiz cohort to those user_ids if land_1 is provided
-if df_l is not None:
-    if date_range is not None and isinstance(date_range, (tuple, list)) and len(date_range) == 2:
-        sd, ed = date_range
-        df_l = df_l[
-            (df_l['landing_at'].dt.date >= sd) &
-            (df_l['landing_at'].dt.date <= ed)
+    with col_metric:
+        metric_options = [
+            'Visitors',
+            'Registered Users',
+            'Landing -> Registration',
+            'Landing -> Onboarding',
+            'Landing -> Payer (24h)',
+            'Reg -> Payer 0d',
+            'ARPU',
+            'ARPPU',
+            'ARPU 0d',
+            'ARPPU 0d',
+            'Total Revenue',
         ]
-    if apply_country_filter and countries:
-        df_l = df_l[df_l['country'].isin(countries)]
-
-    keep_users = set(df_l['user_id'].unique())
-    df_q = df_q[df_q['user_id'].isin(keep_users)]
-
-st.caption(
-    f"**{flow}** · quiz users: **{df_q['user_id'].nunique():,}** · quiz rows: **{len(df_q):,}**"
-    + (f" · land_1 users: **{df_l['user_id'].nunique():,}**" if df_l is not None else "")
-)
-
-if df_q.empty:
-    st.warning("Після фільтрів у quiz-данних не лишилось рядків.")
-    st.stop()
-
-# ─────────────────────────────────────────────────────────────────────
-# Sections (tabs)
-# ─────────────────────────────────────────────────────────────────────
-tab_dropoff, tab_dist, tab_cohort, tab_xtab = st.tabs([
-    "📉 Drop-off",
-    "📊 Answer distribution",
-    "🎯 Cohort builder",
-    "🔀 Cross-tab (A → B)"
-])
-
-# ═════════════════════════════════════════════════════════════════════
-# TAB 1 — Drop-off
-# ═════════════════════════════════════════════════════════════════════
-with tab_dropoff:
-    st.subheader("Drop-off per screen")
-    st.caption("Унікальні юзери що дійшли до кожного екрана. Базою (100%) є перший екран воронки.")
-
-    drop = (df_q.groupby(['screen_order', 'screen_id'])['user_id']
-                .nunique().reset_index(name='users_reached'))
-    # Сортуємо по catalog порядку
-    order_map = {s: i + 1 for i, s in enumerate(screen_order)}
-    drop['screen_order'] = drop['screen_id'].map(order_map).fillna(drop['screen_order'])
-    drop = drop.sort_values('screen_order')
-
-    if not drop.empty:
-        base = drop.iloc[0]['users_reached']
-        drop['pct_of_start'] = drop['users_reached'] / base * 100
-        drop['step_drop_pct'] = drop['users_reached'].pct_change().fillna(0) * 100  # відносно попереднього
-        drop['label'] = drop.apply(
-            lambda r: f"{int(r['users_reached']):,}<br>{r['pct_of_start']:.1f}%",
-            axis=1
+        selected_metrics = st.multiselect(
+            "Metrics to Show",
+            metric_options,
+            default=['Visitors', 'Landing -> Registration', 'Landing -> Payer (24h)', 'ARPU 0d'],
+            key='date_breakdown_metrics'
         )
 
-        fig = px.bar(
-            drop, x='screen_id', y='users_reached',
-            text='label',
-            title=f"Drop-off · {flow}",
-            category_orders={'screen_id': screen_order},
+    min_date = df_dated['landing_at'].min().date()
+    max_date = df_dated['landing_at'].max().date()
+
+    with col_dates:
+        date_range = st.date_input(
+            "Date Range",
+            value=(min_date, max_date),
+            min_value=min_date,
+            max_value=max_date,
+            key='date_breakdown_range'
         )
-        fig.update_traces(textposition='outside', cliponaxis=False)
-        fig.update_layout(
-            xaxis_tickangle=-40,
-            yaxis_title="Unique users reached",
-            margin=dict(t=50, b=120),
-            height=520,
-        )
-        st.plotly_chart(fig, use_container_width=True)
 
-        # Окрема діаграма step-drop
-        st.markdown("##### Step-by-step drop (% від попереднього кроку)")
-        drop['step_drop_label'] = drop['step_drop_pct'].apply(lambda v: f"{v:+.1f}%")
-        fig2 = px.bar(
-            drop, x='screen_id', y='step_drop_pct',
-            text='step_drop_label',
-            color='step_drop_pct',
-            color_continuous_scale='RdYlGn',
-            category_orders={'screen_id': screen_order},
-            title="Step-over-step relative change",
-        )
-        fig2.update_traces(textposition='outside', cliponaxis=False)
-        fig2.update_layout(xaxis_tickangle=-40, yaxis_ticksuffix='%',
-                           coloraxis_showscale=False, height=400, margin=dict(t=50, b=120))
-        st.plotly_chart(fig2, use_container_width=True)
-
-        with st.expander("📋 Drop-off table"):
-            show = drop.copy()
-            show = show.rename(columns={
-                'screen_order': '#',
-                'pct_of_start': '% of start',
-                'step_drop_pct': 'Δ vs prev (%)',
-            })
-            show['% of start']    = show['% of start'].map(lambda v: f"{v:.2f}%")
-            show['Δ vs prev (%)'] = show['Δ vs prev (%)'].map(lambda v: f"{v:+.2f}%")
-            show['users_reached'] = show['users_reached'].map(lambda v: f"{int(v):,}")
-            st.dataframe(show[['#', 'screen_id', 'users_reached', '% of start', 'Δ vs prev (%)']],
-                         hide_index=True, use_container_width=True)
-
-
-# ═════════════════════════════════════════════════════════════════════
-# TAB 2 — Answer distribution per screen
-# ═════════════════════════════════════════════════════════════════════
-with tab_dist:
-    st.subheader("Розподіл відповідей на екрані")
-
-    question_screens = [s for s in screen_order
-                        if s in df_q['screen_id'].unique() and s not in INTERSTITIAL_SCREENS]
-    interstitial_present = [s for s in screen_order
-                            if s in df_q['screen_id'].unique() and s in INTERSTITIAL_SCREENS]
-    show_interstitial = st.checkbox("Включити interstitial-екрани", value=False)
-    options = question_screens + (interstitial_present if show_interstitial else [])
-
-    if not options:
-        st.info("Немає доступних екранів.")
+    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+        start_date, end_date = date_range
     else:
-        c1, c2, c3 = st.columns([2, 1, 1])
-        with c1:
-            screen_pick = st.selectbox("Екран", options, key='dist_screen')
-        with c2:
-            top_n = st.number_input("Top N answers", min_value=5, max_value=100, value=20, step=5)
-        with c3:
-            do_split = is_multi_select(flow, screen_pick)
-            do_split = st.checkbox("Split multi-select", value=do_split,
-                                   help="Розбити 'a, b, c' на 3 окремі відповіді")
+        start_date = end_date = date_range if not isinstance(date_range, (list, tuple)) else date_range[0]
 
-        sub = df_q[df_q['screen_id'] == screen_pick]
-        if do_split:
-            sub = explode_multi(sub)
+    df_dated = df_dated[
+        (df_dated['landing_at'].dt.date >= start_date) &
+        (df_dated['landing_at'].dt.date <= end_date)
+    ]
 
-        total = sub['user_id'].nunique() if not do_split else len(sub)
-        dist = (sub.groupby('answer_value')
-                   .agg(users=('user_id', 'nunique'),
-                        events=('user_id', 'count'))
-                   .reset_index()
-                   .sort_values('users', ascending=False)
-                   .head(int(top_n)))
-        dist['pct'] = dist['users'] / dist['users'].sum() * 100
-        dist['label'] = dist.apply(lambda r: f"{int(r['users']):,} ({r['pct']:.1f}%)", axis=1)
+    if df_dated.empty:
+        st.info("No data in selected date range.")
+        return
 
-        st.caption(f"Унікальні юзери на екрані: **{sub['user_id'].nunique():,}** · "
-                   f"усього (зі сплітом=рядки): **{total:,}**")
+    if not selected_metrics:
+        st.info("Select at least one metric to display.")
+        return
 
-        fig = px.bar(dist, x='users', y='answer_value', orientation='h',
-                     text='label', title=f"{screen_pick} · top-{top_n} answers")
-        fig.update_layout(yaxis={'categoryorder': 'total ascending'},
-                          height=max(360, 24 * len(dist) + 80),
-                          margin=dict(l=10, r=10, t=50, b=10))
-        st.plotly_chart(fig, use_container_width=True)
+    # ── Build period column ───────────────────────────────────────────
+    if granularity == 'Day':
+        df_dated['_period'] = df_dated['landing_at'].dt.date
+    elif granularity == 'Week':
+        df_dated['_period'] = df_dated['landing_at'].dt.to_period('W').apply(lambda p: p.start_time.date())
+    else:
+        df_dated['_period'] = df_dated['landing_at'].dt.to_period('M').apply(lambda p: p.start_time.date())
 
-        with st.expander("📋 Distribution table"):
-            show = dist.rename(columns={'answer_value': 'Answer', 'users': 'Users',
-                                         'events': 'Events', 'pct': '%'})
-            show['Users']  = show['Users'].map(lambda v: f"{int(v):,}")
-            show['Events'] = show['Events'].map(lambda v: f"{int(v):,}")
-            show['%']      = show['%'].map(lambda v: f"{v:.2f}%")
-            st.dataframe(show[['Answer', 'Users', 'Events', '%']],
-                         hide_index=True, use_container_width=True)
+    # ── Aggregate per period × variant ───────────────────────────────
+    periods = sorted(df_dated['_period'].unique())
+    variants_to_show = selected_variants
 
+    def _calc_row(sub_df, period, variant):
+        """Calculate all metrics + raw counts for a given slice."""
+        m = calculate_metrics(sub_df)
+        c = get_conversion_rates(m)
+        return {
+            'Period': str(period),
+            'Variant': variant,
+            # ── raw counts (needed for table annotations) ──
+            'Visitors':             m['Visitors'],
+            'Registered Users':     m['Registered Users'],
+            'Onboarding Users':     m['Onboarding Users'],
+            'Payers':               m['Payers'],
+            'Payers 0d (Landing)':  m['Payers 0d (Landing)'],
+            # ── monetary ──
+            'Total Revenue': m['Total Revenue'],
+            'ARPU':          m['ARPU'],
+            'ARPPU':         m['ARPPU'],
+            'ARPU 0d':       m['ARPU 0d'],
+            'ARPPU 0d':      m['ARPPU 0d'],
+            # ── rate metrics (%) ──
+            'Landing -> Registration': c['Landing -> Registration'],
+            'Landing -> Onboarding':   c['Landing -> Onboarding'],
+            'Landing -> Payer (24h)':  c['Landing -> Payer (24h)'],
+            'Reg -> Payer 0d':         c['Reg -> Payer 0d'],
+            'Registration -> Payer':   c['Registration -> Payer'],
+        }
 
-# ═════════════════════════════════════════════════════════════════════
-# TAB 3 — Cohort builder
-# ═════════════════════════════════════════════════════════════════════
-with tab_cohort:
-    st.subheader("Cohort builder · funnel метрики по сегменту відповіді")
-    st.caption(
-        "Збираєш фільтр (screen, answer) — система знаходить юзерів які так відповіли, "
-        "і рахує всі funnel-метрики для цього сегмента vs решти юзерів воронки."
+    rows = []
+    for period in periods:
+        df_p = df_dated[df_dated['_period'] == period]
+        for variant in variants_to_show:
+            df_pv = df_p[df_p['landingId'] == variant]
+            if df_pv.empty:
+                continue
+            rows.append(_calc_row(df_pv, period, variant))
+
+    if not rows:
+        st.warning("Not enough data to build date breakdown.")
+        return
+
+    df_breakdown = pd.DataFrame(rows)
+
+    # ── Helpers ──────────────────────────────────────────────────────
+    is_rate     = lambda m: m in RATE_COUNTS_MAP
+    is_currency = lambda m: m in ['ARPU', 'ARPPU', 'ARPU 0d', 'ARPPU 0d', 'Total Revenue']
+    is_int      = lambda m: m in ['Visitors', 'Registered Users', 'Onboarding Users',
+                                   'Payers', 'Payers 0d (Landing)']
+
+    def fmt_label(val, metric_name):
+        """Short label for chart data points."""
+        if is_rate(metric_name):
+            return f"{val:.1f}%"
+        elif is_currency(metric_name):
+            return f"${val:.2f}"
+        else:
+            return f"{int(val):,}"
+
+    def fmt_cell(row, metric_name):
+        """
+        Rich cell for table:
+          - rate metric  → '12.34%  (123/1,000)'
+          - currency     → '$1.23'
+          - int metric   → '1,234'
+        """
+        val = row[metric_name]
+        if pd.isnull(val):
+            return "—"
+        if is_rate(metric_name):
+            num_col, den_col = RATE_COUNTS_MAP[metric_name]
+            num = row.get(num_col, 0)
+            den = row.get(den_col, 0)
+            return f"{val:.2f}%  ({int(num):,}/{int(den):,})"
+        elif is_currency(metric_name):
+            return f"${val:.2f}"
+        else:
+            return f"{int(val):,}"
+
+    # ── Display Mode Toggle ───────────────────────────────────────────
+    view_mode = st.radio(
+        "View as",
+        ['📊 Charts', '📋 Table', '📊 Charts + 📋 Table'],
+        horizontal=True,
+        key='date_breakdown_view'
     )
 
-    if df_l is None:
-        st.warning(
-            "⚠️ Без `land_1.csv` тут можна побачити тільки розмір когорти. "
-            "Завантаж land_1.csv зліва щоб мати конверсії, ARPU 0d, payers тощо."
-        )
+    show_charts = '📊' in view_mode
+    show_table  = '📋' in view_mode
 
-    # ── Збір фільтрів
-    question_screens = [s for s in screen_order
-                        if s in df_q['screen_id'].unique() and s not in INTERSTITIAL_SCREENS]
+    # ── CHARTS ────────────────────────────────────────────────────────
+    if show_charts:
+        num_metrics  = len(selected_metrics)
+        cols_per_row = 2 if num_metrics > 1 else 1
+        metric_chunks = [selected_metrics[i:i+cols_per_row] for i in range(0, num_metrics, cols_per_row)]
 
-    cf1, cf2, cf3 = st.columns([2, 3, 1])
-    with cf1:
-        n_filters = st.number_input("Кількість фільтрів (chain AND)", 1, 5, value=1)
-    with cf3:
-        treat_split = st.checkbox(
-            "Match по split items",
-            value=False,
-            help="Якщо True — для multi-select екранів матч робиться по '{answer} є в csv list', "
-                 "не по точному рядку."
-        )
+        for chunk in metric_chunks:
+            chart_cols = st.columns(len(chunk))
+            for col_idx, metric_name in enumerate(chunk):
+                with chart_cols[col_idx]:
 
-    filters = []
-    for i in range(int(n_filters)):
-        with st.container():
-            cs1, cs2 = st.columns([1, 2])
-            with cs1:
-                sf = st.selectbox(
-                    f"Screen #{i+1}", question_screens,
-                    key=f'cohort_screen_{i}',
-                    index=min(i, len(question_screens) - 1) if question_screens else 0
-                )
-            with cs2:
-                sub_for_screen = df_q[df_q['screen_id'] == sf]
-                if treat_split and is_multi_select(flow, sf):
-                    sub_for_screen = explode_multi(sub_for_screen)
-                answer_values = (
-                    sub_for_screen['answer_value']
-                    .value_counts()
-                    .head(80)
-                    .index.tolist()
-                )
-                af = st.multiselect(
-                    f"Answers on {sf}", answer_values,
-                    key=f'cohort_answer_{i}'
-                )
-            filters.append({'screen': sf, 'answers': af})
+                    # Build text labels for every point
+                    df_chart = df_breakdown[['Period', 'Variant', metric_name]].copy()
+                    df_chart['_label'] = df_chart[metric_name].apply(
+                        lambda v: fmt_label(v, metric_name) if pd.notnull(v) else ""
+                    )
 
-    # ── Computing cohort user_ids (intersection of filters)
-    cohort_users = None
-    for f in filters:
-        if not f['answers']:
-            continue
-        sub = df_q[df_q['screen_id'] == f['screen']]
-        if treat_split and is_multi_select(flow, f['screen']):
-            sub_x = explode_multi(sub)
-            uid = set(sub_x[sub_x['answer_value'].isin(f['answers'])]['user_id'].unique())
+                    fig = px.line(
+                        df_chart,
+                        x='Period',
+                        y=metric_name,
+                        color='Variant',
+                        text='_label',          # ← % / $ / count on each point
+                        markers=True,
+                        title=metric_name,
+                        labels={'Period': granularity, metric_name: metric_name}
+                    )
+
+                    # Position labels above markers
+                    fig.update_traces(
+                        textposition='top center',
+                        textfont=dict(size=11),
+                        hovertemplate='%{fullData.name}: %{text}<extra></extra>'
+                    )
+
+                    # Y-axis formatting
+                    if is_rate(metric_name):
+                        fig.update_layout(yaxis_ticksuffix='%', yaxis_tickformat='.1f')
+                    elif is_currency(metric_name):
+                        fig.update_layout(yaxis_tickprefix='$', yaxis_tickformat=',.2f')
+
+                    fig.update_layout(
+                        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+                        margin=dict(t=55, b=30, l=10, r=10),
+                        hovermode='x unified'
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+    # ── TABLE ─────────────────────────────────────────────────────────
+    if show_table:
+
+        # Build all raw cols needed (rates + their counts)
+        raw_cols_needed = set()
+        for m in selected_metrics:
+            if is_rate(m):
+                num_col, den_col = RATE_COUNTS_MAP[m]
+                raw_cols_needed.add(num_col)
+                raw_cols_needed.add(den_col)
+
+        all_needed = ['Period', 'Variant'] + list(raw_cols_needed) + selected_metrics
+        # keep only cols that actually exist in df_breakdown
+        all_needed = [c for c in all_needed if c in df_breakdown.columns]
+        df_rich = df_breakdown[list(dict.fromkeys(all_needed))].copy()  # deduplicated, ordered
+
+        # Apply rich formatting per cell
+        df_display = df_rich[['Period', 'Variant']].copy()
+        for m in selected_metrics:
+            df_display[m] = df_rich.apply(lambda row: fmt_cell(row, m), axis=1)
+
+        # ── Pivot option ─────────────────────────────────────────────
+        pivot_view = st.checkbox("Pivot table (variants as columns)", value=True, key='date_breakdown_pivot')
+
+        if pivot_view and len(selected_metrics) == 1:
+            metric_name = selected_metrics[0]
+            df_pivot = df_display.pivot(index='Period', columns='Variant', values=metric_name)
+            df_pivot.columns.name = None
+            st.dataframe(df_pivot.reset_index(), hide_index=True, use_container_width=True)
+
+        elif pivot_view and len(selected_metrics) > 1:
+            # Period | Metric | Variant_A | Variant_B ...
+            melted = df_display.melt(
+                id_vars=['Period', 'Variant'],
+                value_vars=selected_metrics,
+                var_name='Metric'
+            )
+            pivoted = melted.pivot_table(
+                index=['Period', 'Metric'],
+                columns='Variant',
+                values='value',
+                aggfunc='first'
+            )
+            pivoted.columns.name = None
+            st.dataframe(pivoted.reset_index(), hide_index=True, use_container_width=True)
+
         else:
-            uid = set(sub[sub['answer_value'].isin(f['answers'])]['user_id'].unique())
-        cohort_users = uid if cohort_users is None else (cohort_users & uid)
+            st.dataframe(df_display, hide_index=True, use_container_width=True)
 
-    # ── Базова quiz population для воронки
-    flow_users = set(df_q['user_id'].unique())
+    # ── Delta vs Control strip ────────────────────────────────────────
+    test_variants_for_delta = [v for v in variants_to_show if v != control_variant]
 
-    if cohort_users is None or len(cohort_users) == 0:
-        st.info("Збери хоча б один (screen, answer) фільтр щоб побачити когорту.")
+    if test_variants_for_delta and len(selected_metrics) >= 1:
+        with st.expander("📐 Period-level Delta vs Control", expanded=False):
+            delta_metric = st.selectbox(
+                "Metric for delta view",
+                selected_metrics,
+                key='delta_metric_sel'
+            )
+
+            df_ctrl_ts = df_breakdown[df_breakdown['Variant'] == control_variant][['Period', delta_metric]].rename(
+                columns={delta_metric: '_ctrl'}
+            )
+
+            delta_rows = []
+            for tv in test_variants_for_delta:
+                df_tv = df_breakdown[df_breakdown['Variant'] == tv][['Period', delta_metric]].rename(
+                    columns={delta_metric: '_var'}
+                )
+                merged = pd.merge(df_ctrl_ts, df_tv, on='Period', how='inner')
+                merged['Delta'] = merged['_var'] - merged['_ctrl']
+                merged['Variant'] = tv
+                merged = merged.rename(columns={'_ctrl': f'{control_variant} (ctrl)', '_var': tv})
+                delta_rows.append(merged[['Period', 'Variant', f'{control_variant} (ctrl)', tv, 'Delta']])
+
+            if delta_rows:
+                df_delta = pd.concat(delta_rows, ignore_index=True)
+
+                # Label delta bars
+                suffix = '%' if is_rate(delta_metric) else (
+                    '$' if is_currency(delta_metric) else ''
+                )
+                df_delta['_dlabel'] = df_delta['Delta'].apply(
+                    lambda v: f"{v:+.2f}{suffix}" if pd.notnull(v) else ""
+                )
+
+                fig_delta = px.bar(
+                    df_delta,
+                    x='Period',
+                    y='Delta',
+                    color='Variant',
+                    text='_dlabel',
+                    barmode='group',
+                    title=f"Period Delta: {delta_metric} (Variant − Control)",
+                )
+                fig_delta.update_traces(textposition='outside', textfont=dict(size=11))
+                fig_delta.add_hline(y=0, line_dash='dash', line_color='gray')
+                fig_delta.update_layout(hovermode='x unified')
+                st.plotly_chart(fig_delta, use_container_width=True)
+
+                # Delta table: show formatted values too
+                ctrl_col = f'{control_variant} (ctrl)'
+                df_delta_show = df_delta[['Period', 'Variant', ctrl_col, tv, 'Delta']].copy()
+                if is_rate(delta_metric):
+                    for c in [ctrl_col, tv]:
+                        df_delta_show[c] = df_delta_show[c].apply(lambda v: f"{v:.2f}%" if pd.notnull(v) else "—")
+                    df_delta_show['Delta'] = df_delta_show['Delta'].apply(lambda v: f"{v:+.2f}%" if pd.notnull(v) else "—")
+                elif is_currency(delta_metric):
+                    for c in [ctrl_col, tv]:
+                        df_delta_show[c] = df_delta_show[c].apply(lambda v: f"${v:.2f}" if pd.notnull(v) else "—")
+                    df_delta_show['Delta'] = df_delta_show['Delta'].apply(lambda v: f"${v:+.2f}" if pd.notnull(v) else "—")
+                st.dataframe(df_delta_show, hide_index=True, use_container_width=True)
+
+
+# ============================================================
+# --- 4. UI Layout ---
+# ============================================================
+
+def render_dashboard():
+    # Instructions Expander
+    with st.expander("ℹ️ CSV Format Instructions (Click to Open)"):
+        st.markdown('''
+        **Required Columns:**
+        - `user_id`: Unique Identifier
+        - `landingId`: Variant Name
+        - `landing_at`: Timestamp of landing visit
+        - `order_created_at`: Timestamp of order creation
+        - `reg_at`: Timestamp of registration
+        - `fo_at`: Timestamp of first payment
+        - `amount`: Revenue amount (cents or raw)
+        - `id`: Package ID for granularity
+        
+        **Note:** Max file size 200MB.
+        ''')
+
+    # Sidebar Configuration
+    st.sidebar.title("⚙️ Configuration")
+    stat_method = st.sidebar.radio(
+        "Statistical Approach",
+        ['Bayesian', 'Frequentist (Classical)'],
+        help="Bayesian: Prob to Beat Control. Frequentist: P-value (Z-test/T-test)."
+    )
+    
+    st.title(f"Universal Land Analysis ({stat_method.split()[0]}) 🌍")
+    
+    # Data Loading with Uploader Priority
+    st.sidebar.markdown("---")
+    uploaded_file = st.sidebar.file_uploader("📂 Upload Custom CSV", type=['csv'], help="Upload your own data to analyze.")
+    
+    data = None
+    if uploaded_file:
+        data = load_data(uploaded_file)
+        if data is not None:
+             st.sidebar.success("✅ Custom file loaded")
     else:
-        rest_users = flow_users - cohort_users
+        if DEFAULT_CSV_PATH:
+             data = load_data(DEFAULT_CSV_PATH)
+             if data is not None:
+                 st.sidebar.info(f"Using default data: {DEFAULT_CSV_PATH}")
 
-        st.markdown(f"##### Cohort size: **{len(cohort_users):,}** users · "
-                    f"Rest: **{len(rest_users):,}** users · "
-                    f"Total in flow: **{len(flow_users):,}**")
+    if data is None:
+        st.warning("👋 Welcome! Please upload a CSV file in the sidebar to get started.")
+        return
+        
+    # --- Universal Variant Selector ---
+    all_variants = sorted(data['landingId'].dropna().astype(str).unique())
+    selected_variants = st.multiselect(
+        "Select Variants to Compare", 
+        all_variants, 
+        default=all_variants
+    )
+    
+    if not selected_variants:
+        st.warning("Please select at least one variant.")
+        return
 
-        # ── Якщо є land_1 — рахуємо всі funnel метрики
-        if df_l is not None:
-            method = st.radio("Stat method", ['Bayesian', 'Frequentist'], horizontal=True)
+    df_main = data[data['landingId'].isin(selected_variants)]
 
-            df_cohort = df_l[df_l['user_id'].isin(cohort_users)]
-            df_rest   = df_l[df_l['user_id'].isin(rest_users)]
-
-            m_co  = calculate_metrics(df_cohort)
-            m_re  = calculate_metrics(df_rest)
-            c_co  = conversion_rates(m_co)
-            c_re  = conversion_rates(m_re)
-
-            metric_rows = []
-
-            def add_prop_row(name, num_co, den_co, num_re, den_re):
-                if method == 'Bayesian':
-                    stat, lift = bayes_proportion(num_re, den_re, num_co, den_co)
-                    stat_s = f"{stat:.1%}"
-                else:
-                    stat, lift = freq_proportion(num_re, den_re, num_co, den_co)
-                    stat_s = f"p={stat:.4f}"
-                vd = verdict(stat, lift, method, den_re, den_co)
-                rate_co = (num_co / den_co * 100) if den_co else 0
-                rate_re = (num_re / den_re * 100) if den_re else 0
-                metric_rows.append({
-                    "Metric": name,
-                    "Cohort":  f"{rate_co:.2f}% ({int(num_co):,}/{int(den_co):,})",
-                    "Rest":    f"{rate_re:.2f}% ({int(num_re):,}/{int(den_re):,})",
-                    "Lift":    f"{lift:+.2f}%",
-                    "Stat":    stat_s,
-                    "Verdict": vd,
-                })
-
-            add_prop_row("Landing → Onboarding",
-                         m_co['Onboarding Users'], m_co['Visitors'],
-                         m_re['Onboarding Users'], m_re['Visitors'])
-            add_prop_row("Landing → Registration",
-                         m_co['Registered Users'], m_co['Visitors'],
-                         m_re['Registered Users'], m_re['Visitors'])
-            add_prop_row("Registration → Payer",
-                         m_co['Payers'], m_co['Registered Users'],
-                         m_re['Payers'], m_re['Registered Users'])
-            add_prop_row("Reg → Payer 0d",
-                         m_co['Payers 0d (Landing)'], m_co['Registered Users'],
-                         m_re['Payers 0d (Landing)'], m_re['Registered Users'])
-            add_prop_row("Landing → Payer (24h)",
-                         m_co['Payers 0d (Landing)'], m_co['Visitors'],
-                         m_re['Payers 0d (Landing)'], m_re['Visitors'])
-
-            # Monetary (середні — без стат-теста, просто значення)
-            metric_rows.append({
-                "Metric":  "ARPU 0d ($)",
-                "Cohort":  f"${m_co['ARPU 0d']:.2f}",
-                "Rest":    f"${m_re['ARPU 0d']:.2f}",
-                "Lift":    f"{m_co['ARPU 0d'] - m_re['ARPU 0d']:+.2f}",
-                "Stat":    "",
-                "Verdict": "",
-            })
-            metric_rows.append({
-                "Metric":  "ARPPU 0d ($)",
-                "Cohort":  f"${m_co['ARPPU 0d']:.2f}",
-                "Rest":    f"${m_re['ARPPU 0d']:.2f}",
-                "Lift":    f"{m_co['ARPPU 0d'] - m_re['ARPPU 0d']:+.2f}",
-                "Stat":    "",
-                "Verdict": "",
-            })
-            metric_rows.append({
-                "Metric":  "Total Revenue ($)",
-                "Cohort":  f"${m_co['Total Revenue']:,.0f}",
-                "Rest":    f"${m_re['Total Revenue']:,.0f}",
-                "Lift":    "",
-                "Stat":    "",
-                "Verdict": "",
-            })
-
-            df_metrics = pd.DataFrame(metric_rows)
-
-            def color_row(row):
-                v = row.get('Verdict', '')
-                if 'Winner' in v: return ['background-color: #d1e7dd'] * len(row)
-                if 'Loser'  in v: return ['background-color: #f8d7da'] * len(row)
-                return [''] * len(row)
-
-            st.dataframe(
-                df_metrics.style.apply(color_row, axis=1),
-                hide_index=True, use_container_width=True
-            )
-
-            # Funnel chart for cohort
-            st.markdown("##### Funnel (absolute users)")
-            funnel_stages = ['Visitors', 'Onboarding Users', 'Registered Users',
-                             'Payers 0d (Landing)', 'Payers']
-            funnel_data = []
-            for stage in funnel_stages:
-                funnel_data.append({'Group': 'Cohort', 'Stage': stage, 'Users': m_co[stage]})
-                funnel_data.append({'Group': 'Rest',   'Stage': stage, 'Users': m_re[stage]})
-            df_fun = pd.DataFrame(funnel_data)
-            fig_fun = px.bar(df_fun, x='Stage', y='Users', color='Group', barmode='group',
-                             text='Users')
-            fig_fun.update_traces(texttemplate='%{text:,}', textposition='outside',
-                                  cliponaxis=False)
-            fig_fun.update_layout(height=400, margin=dict(t=30, b=30))
-            st.plotly_chart(fig_fun, use_container_width=True)
-
-        else:
-            # Тільки розмір когорти
-            st.info(
-                f"Когорта містить **{len(cohort_users):,}** unique users "
-                f"({len(cohort_users)/max(len(flow_users),1)*100:.1f}% від воронки). "
-                "Для funnel-метрик завантаж land_1.csv."
-            )
-
-
-# ═════════════════════════════════════════════════════════════════════
-# TAB 4 — Cross-tab (Screen A → Screen B)
-# ═════════════════════════════════════════════════════════════════════
-with tab_xtab:
-    st.subheader("Cross-tab: відповідь на екрані A → відповідь на екрані B")
-    st.caption("Юзери що дійшли до обох екранів. Sankey показує абсолютні потоки, "
-               "stacked bar показує % розподіл всередині кожної відповіді A.")
-
-    question_screens = [s for s in screen_order
-                        if s in df_q['screen_id'].unique() and s not in INTERSTITIAL_SCREENS]
-
-    if len(question_screens) < 2:
-        st.warning("Потрібно щонайменше 2 question-екрани в даних.")
-    else:
-        cx1, cx2, cx3 = st.columns([2, 2, 1])
-        with cx1:
-            scr_a = st.selectbox("Screen A", question_screens, index=0, key='xtab_a')
-        with cx2:
-            default_b_idx = 1 if len(question_screens) > 1 else 0
-            scr_b = st.selectbox("Screen B", question_screens,
-                                  index=default_b_idx, key='xtab_b')
-        with cx3:
-            top_a = st.number_input("Top A", 3, 50, value=8)
-            top_b = st.number_input("Top B", 3, 50, value=8)
-
-        cx4, cx5, cx6 = st.columns([1, 1, 2])
-        with cx4:
-            split_a = st.checkbox("Split A multi", value=is_multi_select(flow, scr_a),
-                                  key='xtab_split_a')
-        with cx5:
-            split_b = st.checkbox("Split B multi", value=is_multi_select(flow, scr_b),
-                                  key='xtab_split_b')
-        with cx6:
-            min_users = st.number_input("Hide cells with users <", 0, 1000, value=10,
-                                         help="Прибирає шумові комбінації")
-
-        if scr_a == scr_b:
-            st.warning("A і B мають бути різними екранами.")
-        else:
-            sub_a = df_q[df_q['screen_id'] == scr_a][['user_id', 'answer_value']].rename(
-                columns={'answer_value': 'A'}
-            )
-            sub_b = df_q[df_q['screen_id'] == scr_b][['user_id', 'answer_value']].rename(
-                columns={'answer_value': 'B'}
-            )
-            if split_a:
-                sub_a = sub_a.assign(A=sub_a['A'].astype(str).str.split(',')).explode('A')
-                sub_a['A'] = sub_a['A'].str.strip()
-                sub_a = sub_a[sub_a['A'] != '']
-            if split_b:
-                sub_b = sub_b.assign(B=sub_b['B'].astype(str).str.split(',')).explode('B')
-                sub_b['B'] = sub_b['B'].str.strip()
-                sub_b = sub_b[sub_b['B'] != '']
-
-            # INNER join — тільки юзери що в обох екранах
-            merged = sub_a.merge(sub_b, on='user_id', how='inner')
-
-            if merged.empty:
-                st.info("Немає юзерів які пройшли обидва екрани.")
+    # --- Filters (Audience) ---
+    with st.expander("🔍 Filter Audience", expanded=True):
+        c1, c2 = st.columns(2)
+        
+        sel_all_c = True
+        if 'country' in df_main.columns:
+            all_c = sorted(df_main['country'].dropna().unique())
+            sel_all_c = c1.checkbox("Select All Countries", value=True)
+            if sel_all_c:
+                countries = all_c
+                c1.multiselect("Countries", all_c, default=all_c, disabled=True)
             else:
-                # Top-N для A та B (за к-стю user_id)
-                top_a_vals = (merged.groupby('A')['user_id'].nunique()
-                              .sort_values(ascending=False).head(int(top_a)).index.tolist())
-                top_b_vals = (merged.groupby('B')['user_id'].nunique()
-                              .sort_values(ascending=False).head(int(top_b)).index.tolist())
-                m_filt = merged[merged['A'].isin(top_a_vals) & merged['B'].isin(top_b_vals)]
+                countries = c1.multiselect("Countries", all_c, default=all_c)
+            if not countries: countries = all_c
+        else:
+            countries = []
+        
+        platforms = []
+        sel_all_p = True
+        if 'platform_name' in df_main.columns:
+            all_p = sorted(df_main['platform_name'].dropna().unique())
+            sel_all_p = c2.checkbox("Select All Platforms", value=True)
+            if sel_all_p:
+                platforms = all_p
+                c2.multiselect("Platforms", all_p, default=all_p, disabled=True)
+            else:
+                platforms = c2.multiselect("Platforms", all_p, default=all_p)
+        
+        traffic_source = []
+        sel_all_s = True
+        if 'source' in df_main.columns:
+            all_s = sorted(df_main['source'].dropna().unique())
+            sel_all_s = c2.checkbox("Select All traffic sources", value=True)
+            if sel_all_s:
+                traffic_source = all_s
+                c2.multiselect("traffic source", all_s, default=all_s, disabled=True)
+            else:
+                traffic_source = c2.multiselect("traffic source", all_s, default=all_s)
 
-                xtab = (m_filt.groupby(['A', 'B'])['user_id']
-                              .nunique().reset_index(name='users'))
-                xtab = xtab[xtab['users'] >= int(min_users)]
+        mask = pd.Series(True, index=df_main.index)
+        
+        if 'country' in df_main.columns and not sel_all_c:
+             mask &= df_main['country'].isin(countries)
+             
+        if 'platform_name' in df_main.columns and not sel_all_p:
+             mask &= df_main['platform_name'].isin(platforms)
 
-                if xtab.empty:
-                    st.info("Усі комбінації відфільтровано порогом 'Hide cells'.")
-                else:
-                    # % within A
-                    totals_a = xtab.groupby('A')['users'].sum().rename('total_A')
-                    xtab = xtab.merge(totals_a, on='A')
-                    xtab['pct_within_A'] = xtab['users'] / xtab['total_A'] * 100
+        if 'source' in df_main.columns and not sel_all_s:
+             mask &= df_main['source'].isin(traffic_source)
+             
+        df_filtered = df_main[mask]
+             
+    st.markdown(f"**Data Points**: {len(df_filtered)} rows | **Traffic Share**: {len(df_filtered)/len(data):.1%}")
 
-                    # ── Sankey
-                    nodes_a = [f"A: {v}" for v in top_a_vals if v in xtab['A'].unique()]
-                    nodes_b = [f"B: {v}" for v in top_b_vals if v in xtab['B'].unique()]
-                    all_nodes = nodes_a + nodes_b
-                    node_idx = {n: i for i, n in enumerate(all_nodes)}
+    if df_filtered.empty:
+        st.warning("No data matches filters.")
+        return
 
-                    sankey_src = [node_idx[f"A: {a}"] for a in xtab['A']]
-                    sankey_tgt = [node_idx[f"B: {b}"] for b in xtab['B']]
-                    sankey_val = xtab['users'].tolist()
-                    sankey_lbl = [f"{r['users']:,} ({r['pct_within_A']:.1f}% of '{r['A']}')"
-                                  for _, r in xtab.iterrows()]
+    # Determine Control
+    possible_controls = [v for v in selected_variants if 'v1' in v]
+    control_variant = possible_controls[0] if possible_controls else selected_variants[0]
+    
+    df_control_stats = df_filtered[df_filtered['landingId'] == control_variant]
+    test_variants = [v for v in selected_variants if v != control_variant]
+    
+    st.header("Executive Summary")
+    
+    exclude_cols = ['user_id', 'landingId', 'amount', 'id', 'product_cluster'] + DATE_COLS
+    all_cat_cols = [c for c in df_filtered.columns if c not in exclude_cols and pd.api.types.is_string_dtype(df_filtered[c])]
+    
+    selected_dims = st.multiselect("Select Dimensions to Scan for Insights", all_cat_cols, default=all_cat_cols)
+    
+    with st.spinner("🤖 Scanning all data dimensions for insights..."):
+        findings = generate_comprehensive_summary(df_filtered, df_control_stats, control_variant, test_variants, method=stat_method, allowed_dims=selected_dims)
+        render_summary_widget(findings, control_variant)
+        
+    stats_data = run_statistics(df_filtered, df_control_stats, control_variant, test_variants, method=stat_method)
 
-                    fig_sankey = go.Figure(go.Sankey(
-                        node=dict(
-                            label=all_nodes,
-                            pad=18, thickness=18,
-                            line=dict(color="rgba(0,0,0,0.3)", width=0.5),
-                        ),
-                        link=dict(
-                            source=sankey_src,
-                            target=sankey_tgt,
-                            value=sankey_val,
-                            customdata=sankey_lbl,
-                            hovertemplate='%{customdata}<extra></extra>',
-                        )
-                    ))
-                    fig_sankey.update_layout(
-                        title=f"Sankey · {scr_a} → {scr_b}",
-                        height=600, margin=dict(t=50, b=20, l=20, r=20)
-                    )
-                    st.plotly_chart(fig_sankey, use_container_width=True)
+    # --- Total Metrics per Variant ---
+    st.subheader("Total Metrics per Variant")
+    
+    total_metrics_names = [
+        'Landing -> Registration',
+        'Landing -> Onboarding',
+        'Landing -> Payer (24h)',
+        'Reg -> Payer 0d',
+    ]
+    
+    total_rows = []
+    for v in selected_variants:
+        df_v = df_filtered[df_filtered['landingId'] == v]
+        m_v = calculate_metrics(df_v)
+        c_v = get_conversion_rates(m_v)
+        
+        row = {"Variant": v, "Visitors": f"{int(m_v['Visitors']):,}"}
+        
+        for met in total_metrics_names:
+            rate = c_v.get(met, 0)
+            if met == 'Landing -> Registration':
+                num, den = int(m_v['Registered Users']), int(m_v['Visitors'])
+            elif met == 'Landing -> Onboarding':
+                num, den = int(m_v['Onboarding Users']), int(m_v['Visitors'])
+            elif met == 'Landing -> Payer (24h)':
+                num, den = int(m_v['Payers 0d (Landing)']), int(m_v['Visitors'])
+            elif met == 'Reg -> Payer 0d':
+                num, den = int(m_v['Payers 0d (Landing)']), int(m_v['Registered Users'])
+            else:
+                num, den = 0, 0
+            
+            row[met] = f"{rate:.2f}% ({num:,}/{den:,})"
+        
+        total_rows.append(row)
+    
+    df_total = pd.DataFrame(total_rows)
+    st.dataframe(df_total, width="stretch", hide_index=True)
 
-                    # ── Stacked bar (% within A)
-                    st.markdown("##### Stacked bar — розподіл B всередині кожної відповіді A")
-                    fig_stack = px.bar(
-                        xtab, x='A', y='pct_within_A', color='B',
-                        text=xtab['pct_within_A'].map(lambda v: f"{v:.0f}%"),
-                        title=f"% B within A · {scr_a} → {scr_b}",
-                        category_orders={'A': top_a_vals, 'B': top_b_vals},
-                    )
-                    fig_stack.update_traces(textposition='inside')
-                    fig_stack.update_layout(
-                        barmode='stack',
-                        yaxis_ticksuffix='%',
-                        xaxis_tickangle=-30,
-                        height=520,
-                        margin=dict(t=50, b=120),
-                    )
-                    st.plotly_chart(fig_stack, use_container_width=True)
+    # ── NEW: Date Breakdown ─────────────────────────────────────────────
+    render_date_breakdown(df_filtered, selected_variants, control_variant)
+    # ───────────────────────────────────────────────────────────────────
 
-                    # ── Heatmap-style table (text)
-                    with st.expander("📋 Cross-tab table (raw + %)"):
-                        pivot_users = xtab.pivot(index='A', columns='B', values='users').fillna(0).astype(int)
-                        pivot_pct   = xtab.pivot(index='A', columns='B', values='pct_within_A').fillna(0)
+    # --- Detailed Performance ---
+    st.subheader("Detailed Performance")
+    
+    metrics_list = [
+        'Landing -> Onboarding', 
+        'Landing -> Registration', 
+        'Registration -> Payer',
+        'Reg -> Payer 0d',
+        'Landing -> Payer (24h)',
+        'ARPU', 
+        'ARPPU',
+        'ARPU 0d',
+        'ARPPU 0d'
+    ]
+    
+    m_c = calculate_metrics(df_filtered[df_filtered['landingId'] == control_variant])
+    c_c = get_conversion_rates(m_c)
+    c_c.update({'ARPU': m_c['ARPU'], 'ARPPU': m_c['ARPPU'], 'ARPU 0d': m_c['ARPU 0d'], 'ARPPU 0d': m_c['ARPPU 0d']})
+    
+    for v in test_variants:
+        st.markdown(f"### {v} vs {control_variant} (Control)")
+        m_v = calculate_metrics(df_filtered[df_filtered['landingId'] == v])
+        c_v = get_conversion_rates(m_v)
+        c_v.update({'ARPU': m_v['ARPU'], 'ARPPU': m_v['ARPPU'], 'ARPU 0d': m_v['ARPU 0d'], 'ARPPU 0d': m_v['ARPPU 0d']})
+        
+        res = stats_data.get(v, {})
+        rows = []
+        for metric in metrics_list:
+            val, uplift = res.get(metric, (0.5, 0.0) if stat_method.startswith('Bayesian') else (1.0, 0.0))
+            is_mon = 'ARP' in metric
 
-                        # Строкова комбінована таблиця
-                        combined = pivot_users.copy().astype(str)
-                        for col in pivot_users.columns:
-                            combined[col] = pivot_users[col].map(lambda v: f"{int(v):,}") + \
-                                            "  (" + pivot_pct[col].map(lambda v: f"{v:.1f}%") + ")"
-                        combined = combined.reindex(
-                            [v for v in top_a_vals if v in combined.index]
-                        )
-                        combined = combined[[c for c in top_b_vals if c in combined.columns]]
-                        st.dataframe(combined.reset_index(), hide_index=True,
-                                     use_container_width=True)
+            def get_ctx(m_dict, met_name):
+                if met_name == 'Landing -> Onboarding':
+                    return int(m_dict['Onboarding Users']), int(m_dict['Visitors'])
+                elif met_name == 'Landing -> Registration':
+                    return int(m_dict['Registered Users']), int(m_dict['Visitors'])
+                elif met_name == 'Registration -> Payer':
+                    return int(m_dict['Payers']), int(m_dict['Registered Users'])
+                elif met_name == 'Reg -> Payer 0d':
+                    return int(m_dict['Payers 0d (Landing)']), int(m_dict['Registered Users'])
+                elif met_name == 'Landing -> Payer (24h)':
+                    return int(m_dict['Payers 0d (Landing)']), int(m_dict['Visitors'])
+                elif met_name == 'ARPU':
+                    return m_dict['Total Revenue'], int(m_dict['Visitors'])
+                elif met_name == 'ARPPU':
+                    return m_dict['Total Revenue'], int(m_dict['Payers'])
+                elif met_name == 'ARPU 0d':
+                    return m_dict['Revenue 0d (Landing)'], int(m_dict['Registered Users'])
+                elif met_name == 'ARPPU 0d':
+                    return m_dict['Revenue 0d (Landing)'], int(m_dict['Payers 0d (Landing)'])
+                return 0, 0
+
+            num_c, den_c = get_ctx(m_c, metric)
+            if is_mon:
+                fmt_c = f"${c_c.get(metric,0):.2f} (${num_c:,.0f}/{den_c:,})"
+            else:
+                fmt_c = f"{c_c.get(metric,0):.2f}% ({num_c:,}/{den_c:,})"
+
+            num_v, den_v = get_ctx(m_v, metric)
+            if is_mon:
+                fmt_v = f"${c_v.get(metric,0):.2f} (${num_v:,.0f}/{den_v:,})"
+            else:
+                fmt_v = f"{c_v.get(metric,0):.2f}% ({num_v:,}/{den_v:,})"
+            
+            upl_d = f"${uplift:+.2f}" if is_mon else f"{uplift:+.2f}%"
+            
+            verdict = get_stat_verdict(val, uplift, stat_method, den_c, den_v)
+            
+            if stat_method.startswith('Bayesian'):
+                stat_s = f"{val:.1%}"
+            else:
+                stat_s = f"{val:.4f}"
+            
+            sig_type = "neutral"
+            if "✅" in verdict or "🚀" in verdict: sig_type = "winner"
+            elif "❌" in verdict or "📉" in verdict: sig_type = "loser"
+
+            rows.append({
+                "Metric": metric, 
+                "Control": fmt_c, 
+                "Variant": fmt_v, 
+                "Diff / Uplift": upl_d,
+                "Stat": stat_s,
+                "_status": sig_type
+            })
+        
+        df_display = pd.DataFrame(rows)
+        
+        def highlight_row(row):
+            status = row['_status']
+            if status == 'winner':
+                return ['background-color: #d1e7dd'] * len(row)
+            elif status == 'loser':
+                return ['background-color: #f8d7da'] * len(row)
+            return [''] * len(row)
+
+        st.dataframe(
+            df_display.style.apply(highlight_row, axis=1),
+            width="stretch",
+            hide_index=True,
+            column_config={'_status': None}
+        )
+
+    # --- Visual Analysis ---
+    st.subheader("Visual Analysis")
+    t1, t2, t3, t4 = st.tabs(["Funnel", "Revenue Dist", "Deep Dive: ARPPU Impact", "Audience Structure"])
+
+    with t1:
+        funnel_data = []
+        funnel_metric_names = ['Visitors', 'Onboarding Users', 'Registered Users', 'Payers', 'Payers 0d (Landing)']
+        
+        for v in [control_variant] + test_variants:
+            m = calculate_metrics(df_filtered[df_filtered['landingId'] == v])
+            for stage in funnel_metric_names:
+                funnel_data.append({'Variant': v, 'Stage': stage, 'Count': m[stage]})
+        
+        df_funnel = pd.DataFrame(funnel_data).drop_duplicates()
+        if not df_funnel.empty:
+            df_funnel = df_funnel.sort_values(by='Count', ascending=False)
+            
+            fig_funnel = px.bar(df_funnel, x='Stage', y='Count', color='Variant', barmode='group')
+            fig_funnel.update_traces(hovertemplate='<b>%{x}</b><br>Variant: %{fullData.name}<br>Count: %{y}<extra></extra>')
+            st.plotly_chart(fig_funnel, use_container_width=True)
+
+    with t2:
+         fig_box = px.box(df_filtered, x='landingId', y='amount', title="Revenue per User Distribution")
+         st.plotly_chart(fig_box, use_container_width=True)
+
+    with t3:
+        st.markdown("##### ARPPU Drivers & Package Impact Analysis")
+        
+        c3, c4 = st.columns(2)
+        comp_control = c3.selectbox("Control Group", selected_variants, index=0)
+        def_test_idx = 1 if len(selected_variants) > 1 else 0
+        comp_test = c4.selectbox("Test Group", selected_variants, index=def_test_idx)
+        
+        pkg_view = st.radio("View Packages By:", ['Product Clusters', 'Raw Package IDs'], horizontal=True)
+        col_group = 'product_cluster' if pkg_view == 'Product Clusters' else 'id'
+        
+        if col_group in df_filtered.columns:
+            payers_per_variant = df_filtered[df_filtered['fo_at'].notnull()].groupby('landingId')['user_id'].nunique().to_dict()
+            df_rev_pkg = df_filtered[df_filtered['fo_at'].notnull()].groupby(['landingId', col_group])['amount'].sum().reset_index()
+            
+            df_rev_pkg['total_payers'] = df_rev_pkg['landingId'].map(payers_per_variant)
+            df_rev_pkg['contribution'] = df_rev_pkg['amount'] / df_rev_pkg['total_payers']
+            
+            fig_stack = px.bar(df_rev_pkg, x='landingId', y='contribution', color=col_group,
+                               title=f"ARPPU Composition by {pkg_view} ($)", 
+                               labels={'contribution': 'Contribution to ARPPU ($)', col_group: pkg_view})
+            fig_stack.update_layout(yaxis_tickformat='$.2f')
+            fig_stack.update_traces(hovertemplate='<b>%{data.name}</b><br>Contrib: $%{y:.2f}<extra></extra>')
+            st.plotly_chart(fig_stack, use_container_width=True)
+            
+            df_pivot = df_rev_pkg.pivot(index=col_group, columns='landingId', values='contribution').fillna(0)
+            
+            if comp_control in df_pivot.columns and comp_test in df_pivot.columns:
+                st.markdown(f"**Impact Dictionary: {comp_test} vs {comp_control}**")
+                
+                diff_col = 'Impact'
+                df_pivot[diff_col] = df_pivot[comp_test] - df_pivot[comp_control]
+                df_impact = df_pivot[[diff_col]].sort_values(diff_col, ascending=True).reset_index()
+                
+                fig_imp = px.bar(df_impact, y=col_group, x=diff_col, orientation='h',
+                                 title=f"{pkg_view} Impact on ARPPU: {comp_test} vs {comp_control}",
+                                 color=diff_col, color_continuous_scale='RdBu')
+                fig_imp.update_layout(xaxis_tickformat='$.2f')
+                fig_imp.update_traces(hovertemplate='<b>%{y}</b><br>Impact: $%{x:.2f}<extra></extra>')
+                st.plotly_chart(fig_imp, use_container_width=True)
+                
+                best_pkg = df_impact.iloc[-1]
+                worst_pkg = df_impact.iloc[0]
+                insight_text = []
+                if best_pkg[diff_col] > 0.05:
+                    insight_text.append(f"Growth driven by **{best_pkg[col_group]}** (+${best_pkg[diff_col]:.2f}).")
+                if worst_pkg[diff_col] < -0.05:
+                    insight_text.append(f"Offset by drop in **{worst_pkg[col_group]}** (${worst_pkg[diff_col]:.2f}).")
+                if insight_text:
+                    st.info(" ".join(insight_text))
+            
+        else:
+            st.warning(f"Column '{col_group}' unavailable.")
+
+    with t4:
+        exclude_cols = ['user_id', 'landingId', 'amount', 'id', 'product_cluster'] + DATE_COLS
+        cat_cols = [c for c in df_filtered.columns if c not in exclude_cols and pd.api.types.is_string_dtype(df_filtered[c])]
+        
+        if 'country' in df_filtered.columns and 'country' not in cat_cols: cat_cols.append('country')
+        if 'platform_name' in df_filtered.columns and 'platform_name' not in cat_cols: cat_cols.append('platform_name')
+        if 'platform_model' in df_filtered.columns and 'platform_model' not in cat_cols: cat_cols.append('platform_model')
+        if 'source' in df_filtered.columns and 'source' not in cat_cols: cat_cols.append('source')
+        cat_cols = sorted(list(set(cat_cols)))
+        
+        if cat_cols:
+            dim_sel = st.selectbox("Choose Breakdown Dimension", cat_cols, index=0 if 'country' not in cat_cols else cat_cols.index('country'))
+            
+            top_vals = df_filtered[dim_sel].value_counts().nlargest(15).index
+            df_sub = df_filtered[df_filtered[dim_sel].isin(top_vals)]
+            
+            df_g = df_sub.groupby(['landingId', dim_sel]).size().reset_index(name='count')
+            df_g['share'] = df_g.groupby('landingId')['count'].transform(lambda x: x/x.sum())
+            
+            fig = px.bar(df_g, x='landingId', y='share', color=dim_sel, barmode='stack', title=f"Audience Split by {dim_sel}")
+            fig.layout.yaxis.tickformat = '.0%'
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.warning("No categorical columns found for Audience Structure.")
+
+if __name__ == "__main__":
+    render_dashboard()
