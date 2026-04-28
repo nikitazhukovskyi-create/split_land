@@ -36,9 +36,7 @@ st.set_page_config(
 
 st.title("🧪 Cohort Quiz Analysis")
 st.caption(
-    "Глибокий когортний аналіз воронок **mm-sq1-v1** та **mf-sq1-v1**. "
-    "Завантаж long-format quiz CSV (з bq_extract_guide.md, секції 1.2 / 2.2). "
-    "Опційно — land_1.csv для розрахунку конверсій / ARPU по когортах."
+    "Глибокий когортний аналіз воронок **mm-sq1-v1** та **mf-sq1-v1**. " 
 )
 
 # ─────────────────────────────────────────────────────────────────────
@@ -210,9 +208,7 @@ with st.expander("📋 BQ queries — для оновлення даних",
 
     with sql_tabs[0]:
         st.markdown(
-            "**Запусти першим.** Перевіряє що landingId, дати і grain даних "
-            "правильні. Має повернути 4 рядки (2 для landing + 2 для quiz). "
-            "Quiz unique users має бути ≤ landing users."
+            ""
         )
         st.code(SQL_SANITY, language='sql')
 
@@ -249,9 +245,6 @@ with st.expander("📋 BQ queries — для оновлення даних",
 | `Resources exceeded` | Забув `BETWEEN start_date AND end_date` — партиція обов'язкова |
 | 0 рядків у quiz | `name = 'user_action'` (НЕ `'page_show'`) |
 | Дублі в quiz | `QUALIFY ROW_NUMBER` уже в запиті — має бути 0; якщо є, значить запит редагувався |
-
-**Якщо потрібен один запит з denormalized даними** — дивись `bq_queries_for_cohort_page.md`
-секція 5 (bonus). Для звичайної роботи зі сторінкою — два окремих CSV кращі.
 """)
 
 # ─────────────────────────────────────────────────────────────────────
@@ -696,10 +689,7 @@ with st.sidebar.expander("Які екрани декодуються?"):
 # ─────────────────────────────────────────────────────────────────────
 if df_quiz is None or df_quiz.empty:
     st.info(
-        "👈 Завантаж long-format quiz CSV у бічній панелі.\n\n"
-        "Очікувані колонки: `user_id`, `landingId`, `screen_id`, `answer_value`. "
-        "Опційно: `screen_order`, `event_at`, `flowId`, `question_text`.\n\n"
-        "SQL для extract'а — в `bq_extract_guide.md`, секції 1.2 (mm) та 2.2 (mf)."
+        ""
     )
     with st.expander("ℹ️ Швидкий приклад SQL для extract"):
         st.code("""
