@@ -36,7 +36,9 @@ st.set_page_config(
 
 st.title("🧪 Cohort Quiz Analysis")
 st.caption(
-    "Глибокий когортний аналіз воронок **mm-sq1-v1** та **mf-sq1-v1**. " 
+    "Глибокий когортний аналіз воронок **mm-sq1-v1** та **mf-sq1-v1**. "
+    "Завантаж long-format quiz CSV (з bq_extract_guide.md, секції 1.2 / 2.2). "
+    "Опційно — land_1.csv для розрахунку конверсій / ARPU по когортах."
 )
 
 # ─────────────────────────────────────────────────────────────────────
@@ -208,7 +210,9 @@ with st.expander("📋 BQ queries — для оновлення даних",
 
     with sql_tabs[0]:
         st.markdown(
-            ""
+            "**Запусти першим.** Перевіряє що landingId, дати і grain даних "
+            "правильні. Має повернути 4 рядки (2 для landing + 2 для quiz). "
+            "Quiz unique users має бути ≤ landing users."
         )
         st.code(SQL_SANITY, language='sql')
 
@@ -245,6 +249,9 @@ with st.expander("📋 BQ queries — для оновлення даних",
 | `Resources exceeded` | Забув `BETWEEN start_date AND end_date` — партиція обов'язкова |
 | 0 рядків у quiz | `name = 'user_action'` (НЕ `'page_show'`) |
 | Дублі в quiz | `QUALIFY ROW_NUMBER` уже в запиті — має бути 0; якщо є, значить запит редагувався |
+
+**Якщо потрібен один запит з denormalized даними** — дивись `bq_queries_for_cohort_page.md`
+секція 5 (bonus). Для звичайної роботи зі сторінкою — два окремих CSV кращі.
 """)
 
 # ─────────────────────────────────────────────────────────────────────
@@ -322,7 +329,26 @@ ANSWER_DECODERS = {
             '7': 'Never been married',
         },
     },
-    # 'mf-sq1-v1': { ... }   — дoдай коли отримаєш мапи для female flow
+    'mf-sq1-v1': {
+        'target': {
+            '3': 'Friendship',
+            '4': 'Casual dating',
+            '5': 'Marriage',
+            '6': 'Relationship',
+            '7': 'Companionship',
+            '8': 'Yet to discover',
+        },
+        'marital-status': {
+            '0': 'Invalid',
+            '1': 'Empty',
+            '2': 'Single',
+            '3': 'Separated',
+            '4': 'Divorced',
+            '5': 'Widow',
+            '6': 'Prefer not to say',
+            '7': 'Never been married',
+        },
+    },
 }
 
 
@@ -689,7 +715,10 @@ with st.sidebar.expander("Які екрани декодуються?"):
 # ─────────────────────────────────────────────────────────────────────
 if df_quiz is None or df_quiz.empty:
     st.info(
-        ""
+        "👈 Завантаж long-format quiz CSV у бічній панелі.\n\n"
+        "Очікувані колонки: `user_id`, `landingId`, `screen_id`, `answer_value`. "
+        "Опційно: `screen_order`, `event_at`, `flowId`, `question_text`.\n\n"
+        "SQL для extract'а — в `bq_extract_guide.md`, секції 1.2 (mm) та 2.2 (mf)."
     )
     with st.expander("ℹ️ Швидкий приклад SQL для extract"):
         st.code("""
