@@ -328,6 +328,15 @@ ANSWER_DECODERS = {
             '6': 'Prefer not to say',
             '7': 'Never been married',
         },
+        # partner-age — values are relative-age offsets (years) to user's age:
+        #   'My age'         → -10 / +10  (stored as '10-10')
+        #   'Younger than me' → -20 / 0   (stored as '20-0')
+        #   'Older than me'  → 0 / +20    (stored as '0-20')
+        'partner-age': {
+            '10-10': 'My age',
+            '20-0':  'Younger than me',
+            '0-20':  'Older than me',
+        },
     },
     'mf-sq1-v1': {
         'target': {
